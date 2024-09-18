@@ -8,12 +8,11 @@
 """
 Util module.
 """
-
-
 import itertools
 import json
-from typing import TextIO
 import os
+from typing import TextIO
+
 import portalocker
 
 from codechecker_common.logger import get_logger
@@ -26,12 +25,18 @@ def arg_match(options, args):
     that are present in parameter 'args'."""
     matched_args = []
     for option in options:
-        if any([arg if option.startswith(arg) else None
-                for arg in args]):
+        if any(arg if option.startswith(arg) else None for arg in args):
             matched_args.append(option)
             continue
 
     return matched_args
+
+
+def clamp(min_: int, value: int, max_: int) -> int:
+    """Clamps ``value`` such that ``min_ <= value <= max_``."""
+    if min_ > max_:
+        raise ValueError("min <= max required")
+    return min(max(min_, value), max_)
 
 
 def chunks(iterator, n):
@@ -68,10 +73,6 @@ def load_json(path: str, default=None, lock=False, display_warning=True):
 
             if lock:
                 portalocker.unlock(handle)
-    except IOError as ex:
-        if display_warning:
-            LOG.warning("Failed to open json file: %s", path)
-            LOG.warning(ex)
     except OSError as ex:
         if display_warning:
             LOG.warning("Failed to open json file: %s", path)
@@ -106,3 +107,8 @@ def path_for_fake_root(full_path: str, root_path: str = '/') -> str:
     relative_path = os.path.relpath(full_path, '/')
     fake_root_path = os.path.join(root_path, relative_path)
     return os.path.realpath(fake_root_path)
+
+
+def strtobool(value: str) -> bool:
+    """Parse a string value to a boolean."""
+    return value.lower() in ('y', 'yes', 't', 'true', 'on', '1')

@@ -24,8 +24,6 @@ from libtest import project
 from codechecker_api.codeCheckerDBAccess_v6.ttypes import \
     Order, Pair, ReportFilter, SortMode, SortType
 
-from libtest import env
-
 
 class DynamicResults(unittest.TestCase):
 
@@ -86,7 +84,7 @@ class DynamicResults(unittest.TestCase):
         print("Removing: " + TEST_WORKSPACE)
         shutil.rmtree(TEST_WORKSPACE, ignore_errors=True)
 
-    def setup_method(self, method):
+    def setup_method(self, _):
         self.test_workspace = os.environ['TEST_WORKSPACE']
 
         test_class = self.__class__.__name__
@@ -136,10 +134,23 @@ class DynamicResults(unittest.TestCase):
         results = self._cc_client.getRunResults(
             None, 500, 0, None, testcase_filter, None, False)
 
-        self.assertEqual(len(results), 3)
+        self.assertEqual(len(results), 2)
 
         self.assertTrue(all(map(
             lambda report: report.annotations['testcase'] == 'TC-1',
+            results)))
+
+        testcase_filter = ReportFilter(annotations=[Pair(
+            first='testcase',
+            second='TC-*')])
+
+        results = self._cc_client.getRunResults(
+            None, 500, 0, None, testcase_filter, None, False)
+
+        self.assertEqual(len(results), 3)
+
+        self.assertTrue(all(map(
+            lambda report: report.annotations['testcase'].startswith('TC-'),
             results)))
 
     def test_count_by_attribute(self):
@@ -158,4 +169,4 @@ class DynamicResults(unittest.TestCase):
         num = self._cc_client.getRunResultCount(
             None, testcase_filter, None)
 
-        self.assertEqual(num, 3)
+        self.assertEqual(num, 2)

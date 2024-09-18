@@ -271,7 +271,87 @@
       />
     </template>
 
-    <template slot="body.append">
+    <template #item.enabledInAllRuns="{ item }">
+      <div v-if="item.enabledInAllRuns">
+        <count-chips
+          :num-good="item.enabledRunLength"
+          :good-text="'Number of runs where checker was enabled'"
+          :show-dividers="false"
+          :show-zero-chips="false"
+          @showing-good-click="$emit('enabled-click', 'enabled', item.checker)"
+        />
+      </div>
+      <div v-else>
+        <count-chips
+          :num-good="item.enabledRunLength"
+          :num-bad="item.disabledRunLength"
+          :good-text="'Number of runs where checker was enabled'"
+          :bad-text="'Number of runs where checker was disabled'"
+          :show-dividers="false"
+          :show-zero-chips="false"
+          @showing-good-click="$emit('enabled-click', 'enabled', item.checker)"
+          @showing-bad-click="$emit('enabled-click', 'disabled', item.checker)"
+        />
+      </div>
+    </template>
+
+    <template #item.closed="{ item }">
+      <span v-if="item.closed">
+        <router-link
+          :to="{ name: 'reports', query: {
+            ...uniqueMode,
+            ...getBaseQueryParams(item),
+            'report-status': reportStatusFromCodeToString(ReportStatus.CLOSED)
+          }}"
+        >
+          {{ item.closed }}
+        </router-link>
+      </span>
+      <span v-else>
+        {{ item.closed }}
+      </span>
+    </template>
+
+    <template #item.outstanding="{ item }">
+      <span v-if="item.outstanding">
+        <router-link
+          :to="{ name: 'reports', query: {
+            ...uniqueMode,
+            ...getBaseQueryParams(item),
+            'report-status': reportStatusFromCodeToString(
+              ReportStatus.OUTSTANDING
+            )
+          }}"
+        >
+          {{ item.outstanding }}
+        </router-link>
+      </span>
+      <span v-else>
+        {{ item.outstanding }}
+      </span>
+    </template>
+
+    <template #item.guidelineRules="{ item }">
+      <div v-if="item.guidelineRules.length">
+        <div 
+          v-for="guidelineRule in item.guidelineRules"
+          :key="guidelineRule.type"
+        >
+          <span class="type">
+            {{ guidelineRule.type }}:
+          </span>
+          <span 
+            v-for="rule in guidelineRule.rules"
+            :key="rule"
+            :style="getRuleStyle(guidelineRule)"
+          >
+            {{ rule }}
+          </span>
+        </div>
+      </div>
+    </template>
+
+    <template v-if="necessaryTotal" slot="body.append">
       <tr>
         <td class="text-center" :colspan="colspan">
           <strong>Total</strong>
@@ -296,26 +376,42 @@
 </template>
 
 <script>
-import { DetectionStatus, ReviewStatus } from "@cc/report-server-types";
+import {
+  DetectionStatus,
+  ReportStatus,
+  ReviewStatus
+} from "@cc/report-server-types";
 import {
   DetectionStatusIcon,
   ReviewStatusIcon,
   SeverityIcon
 } from "@/components/Icons";
-import { ReviewStatusMixin, SeverityMixin } from "@/mixins";
+import {
+  DetectionStatusMixin,
+  ReportStatusMixin,
+  ReviewStatusMixin,
+  SeverityMixin
+} from "@/mixins";
+import CountChips from "@/components/CountChips";
 import { SourceComponentTooltip } from "@/components/Report/SourceComponent";
 import ReportDiffCount from "./ReportDiffCount";
 
 export default {
-  name: "ReviewStatusStatisticsTable",
+  name: "BaseStatisticsTable",
   components: {
+    CountChips,
     DetectionStatusIcon,
     ReportDiffCount,
     ReviewStatusIcon,
     SeverityIcon,
     SourceComponentTooltip
   },
-  mixins: [ ReviewStatusMixin, SeverityMixin ],
+  mixins: [
+    DetectionStatusMixin,
+    ReportStatusMixin,
+    ReviewStatusMixin,
+    SeverityMixin
+  ],
   props: {
     items: { type: Array, required: true },
     colspan: { type: Number, default: 2 },
@@ -323,12 +419,14 @@ export default {
       type: Array,
       default: () => [ "unreviewed", "confirmed", "outstanding",
         "falsePositive", "intentional", "suppressed","reports" ]
-    }
+    },
+    necessaryTotal: { type: Boolean, default: false }
   },
   data() {
     return {
-      ReviewStatus,
-      DetectionStatus
+      DetectionStatus,
+      ReportStatus,
+      ReviewStatus
     };
   },
   computed: {
@@ -342,6 +440,15 @@ export default {
         this.totalColumns.forEach(c => total[c] += curr[c].count);
         return total;
       }, initVal);
+    },
+
+    uniqueMode() {
+      if ( this.$router.currentRoute.query["is-unique"] !== undefined ) {
+        return {
+          "is-unique": this.$router.currentRoute.query["is-unique"]
+        };
+      }
+      else return {};
     }
   },
   methods: {
@@ -358,6 +465,13 @@ export default {
         query["severity"] = this.severityFromCodeToString(severity);
 
       return query;
+    },
+
+    getRuleStyle(guidelineRule) {
+      return {
+        display: guidelineRule.rules.length > 1 ? "block" : "inline-block",
+        "margin-left": guidelineRule.rules.length > 1 ? "1em" : "0"
+      };
     }
   }
 };
@@ -374,5 +488,9 @@ export default {
   &:not(.severity):hover {
     text-decoration: underline;
   }
+}
+
+.type {
+  font-weight: bold;
 }
 </style>

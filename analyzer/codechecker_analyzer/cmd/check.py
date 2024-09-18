@@ -17,26 +17,26 @@ import shutil
 import sys
 import tempfile
 
-import multiprocess
-
 from codechecker_analyzer.analyzers import analyzer_types
 from codechecker_analyzer.arg import \
     OrderedCheckersAction, OrderedConfigAction, \
     analyzer_config, checker_config, existing_abspath
 
+from codechecker_analyzer.cmd.analyze import \
+    EPILOG_ENV_VAR as analyzer_epilog_env_var, \
+    EPILOG_ISSUE_HASHES as analyzer_epilog_issue_hashes
+
+from codechecker_analyzer.cmd.log import \
+    EPILOG_ENV_VAR as log_epilog_env_var
+
+from codechecker_analyzer.cmd.parse import \
+    EPILOG_ENV_VAR as parse_epilog_env_var
+
 from codechecker_common import arg, cmd_config, logger
+from codechecker_common.compatibility.multiprocessing import cpu_count
 from codechecker_common.source_code_comment_handler import \
     REVIEW_STATUS_VALUES
 
-from codechecker_analyzer.cmd.analyze import \
-    epilog_env_var as analyzer_epilog_env_var, \
-    epilog_issue_hashes as analyzer_epilog_issue_hashes
-
-from codechecker_analyzer.cmd.log import \
-    epilog_env_var as log_epilog_env_var
-
-from codechecker_analyzer.cmd.parse import \
-    epilog_env_var as parse_epilog_env_var
 
 LOG = logger.get_logger('system')
 
@@ -152,6 +152,17 @@ def add_arguments_to_parser(parser):
                              "fails with error message related to __builtin "
                              "symbols.")
 
+    parser.add_argument('--add-gcc-include-dirs-with-isystem',
+                        dest="add_gcc_include_dirs_with_isystem",
+                        required=False,
+                        action='store_true',
+                        default=False,
+                        help="Implicit include directories are appended to "
+                             "the analyzer command with -idirafter. If "
+                             "-isystem is needed instead, as it was used "
+                             "before CodeChecker 6.24.1, this flag can be "
+                             "used.")
+
     log_args = parser.add_argument_group(
         "log arguments",
         """
@@ -183,8 +194,7 @@ used to generate a log file on the fly.""")
                                type=int,
                                dest="jobs",
                                required=False,
-                               # pylint: disable=no-member
-                               default=multiprocess.cpu_count(),
+                               default=cpu_count(),
                                help="Number of threads to use in analysis. "
                                     "More threads mean faster analysis at "
                                     "the cost of using more memory.")
@@ -295,7 +305,7 @@ used to generate a log file on the fly.""")
                                metavar='ANALYZER',
                                required=False,
                                choices=analyzer_types.supported_analyzers,
-                               default=argparse.SUPPRESS,
+                               default=None,
                                help="Run analysis only with the analyzers "
                                     "specified. Currently supported analyzers "
                                     "are: " +
@@ -733,7 +743,9 @@ LLVM/Clang community, and thus discouraged.
                                default=argparse.SUPPRESS,
                                help="Emit a warning instead of an error when "
                                     "an unknown checker name is given to "
-                                    "either --enable or --disable.")
+                                    "either --enable, --disable,"
+                                    "--analyzer-config and/or "
+                                    "--checker-config.")
 
     output_opts = parser.add_argument_group("output arguments")
 
@@ -786,8 +798,7 @@ LLVM/Clang community, and thus discouraged.
                         choices=REVIEW_STATUS_VALUES,
                         default=["confirmed", "unreviewed"],
                         help="Filter results by review statuses. Valid "
-                             "values are: {0}".format(
-                            ', '.join(REVIEW_STATUS_VALUES)))
+                             "values are: {', '.join(REVIEW_STATUS_VALUES)}")
 
     logger.add_verbose_arguments(parser)
     parser.set_defaults(
@@ -881,6 +892,7 @@ def main(args):
                           'capture_analysis_output',
                           'generate_reproducer',
                           'config_file',
+                          'ctu_ast_mode',
                           'ctu_phases',
                           'ctu_reanalyze_on_failure',
                           'stats_output',
@@ -890,11 +902,13 @@ def main(args):
                           'stats_min_sample_count',
                           'enable_all',
                           'disable_all',
+                          'no_missing_checker_error',
                           'ordered_checkers',  # --enable and --disable.
                           'timeout',
                           'review_status_config',
                           'compile_uniqueing',
                           'report_hash',
+                          'add_gcc_include_dirs_with_isystem',
                           'enable_z3',
                           'enable_z3_refutation']
         for key in args_to_update:
@@ -902,6 +916,7 @@ def main(args):
         if 'clean' in args:
             setattr(analyze_args, 'clean', True)
         __update_if_key_exists(args, analyze_args, 'verbose')
+        __update_if_key_exists(args, analyze_args, 'no_missing_checker_error')
 
         import codechecker_analyzer.cmd.analyze as analyze_module
         LOG.debug("Calling ANALYZE with args:")

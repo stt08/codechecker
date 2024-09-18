@@ -30,6 +30,9 @@ from . import ctu_triple_arch
 LOG = get_logger('analyzer')
 
 
+# The inheritence comes from the YAML parser, we can't solve it with less
+# ancestors.
+# pylint: disable=too-many-ancestors
 class LLVMComatibleYamlDumper(Dumper):
     def check_simple_key(self):
         """ Mark every keys as simple keys.
@@ -123,11 +126,10 @@ def generate_ast(triple_arch, action, source, config):
             os.makedirs(ast_dir)
         except OSError:
             pass
-
     cmdstr = ' '.join(cmd)
     LOG.debug_analyzer("Generating AST using '%s'", cmdstr)
     ret_code, _, err = \
-        analyzer_base.SourceAnalyzer.run_proc(cmd, action.directory)
+        analyzer_base.SourceAnalyzer.run_proc(cmd, action.directory, None)
 
     if ret_code != 0:
         LOG.error("Error generating AST.\n\ncommand:\n\n%s\n\nstderr:\n\n%s",

@@ -7,6 +7,8 @@
         :show-remove-filtered-reports="false"
         :report-count="reportCount"
         :show-diff-type="false"
+        :show-compare-to="
+          $router.currentRoute.name != 'checker-coverage-statistics'"
         @refresh="refresh"
       />
     </pane>
@@ -82,6 +84,11 @@ export default {
         name: "Component Statistics",
         icon: "mdi-puzzle-outline",
         to: { name: "component-statistics" }
+      },
+      {
+        name: "Checker Coverage",
+        icon: "mdi-clipboard-check-outline",
+        to: { name: "checker-coverage-statistics" }
       },
     ];
 

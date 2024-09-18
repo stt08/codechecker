@@ -20,8 +20,10 @@ import os
 import signal
 import sys
 import tempfile
+import uuid
 import zipfile
 import zlib
+import shutil
 
 from collections import defaultdict, namedtuple
 from contextlib import contextmanager
@@ -39,22 +41,28 @@ from codechecker_report_converter.report.hash import HashType, \
     get_report_path_hash
 from codechecker_report_converter.report.parser.base import AnalyzerInfo
 
+try:
+    from codechecker_client.blame_info import assemble_blame_info
+except ImportError:
+    def assemble_blame_info(_, __) -> int:
+        """
+        Shim for cases where Git blame info is not gatherable due to
+        missing libraries.
+        """
+        raise NotImplementedError()
+
 from codechecker_client import client as libclient
 from codechecker_client import product
 from codechecker_common import arg, logger, cmd_config
 from codechecker_common.checker_labels import CheckerLabels
+from codechecker_common.compatibility.multiprocessing import Pool
 from codechecker_common.source_code_comment_handler import \
     SourceCodeCommentHandler
 from codechecker_common.util import load_json
-from codechecker_common.multiprocesspool import MultiProcessPool
 
 from codechecker_web.shared import webserver_context, host_check
 from codechecker_web.shared.env import get_default_workspace
 
-try:
-    from codechecker_client.blame_info import assemble_blame_info
-except ImportError:
-    pass
 
 LOG = logger.get_logger('system')
 
@@ -135,9 +143,9 @@ def sizeof_fmt(num, suffix='B'):
     """
     for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
         if abs(num) < 1024.0:
-            return "%3.1f%s%s" % (num, unit, suffix)
+            return f"{num:3.1f}{unit}{suffix}"
         num /= 1024.0
-    return "%.1f%s%s" % (num, 'Yi', suffix)
+    return f"{num:.1f}Yi{suffix}"
 
 
 def get_file_content_hash(file_path):
@@ -301,7 +309,7 @@ exist prior to the 'store' command being ran.""")
 def __get_run_name(input_list):
     """Create a runname for the stored analysis from the input list."""
 
-    # Try to create a name from the metada JSON(s).
+    # Try to create a name from the metadata JSON(s).
     names = set()
     for input_path in input_list:
         metafile = os.path.join(input_path, "metadata.json")
@@ -325,8 +333,8 @@ def __get_run_name(input_list):
             return name
     elif len(names) > 1:
         return "multiple projects: " + ', '.join(names)
-    else:
-        return False
+
+    return False
 
 
 def scan_for_review_comment(job: Tuple[str, Iterable[int]]):
@@ -372,7 +380,7 @@ def filter_source_files_with_comments(
     """
     jobs = file_report_positions.items()
 
-    with MultiProcessPool() as executor:
+    with Pool() as executor:
         return get_source_file_with_comments(jobs, executor.map)
 
 
@@ -443,7 +451,7 @@ def assemble_zip(inputs,
 
         skip_file_path = os.path.join(dir_path, 'skip_file')
         if os.path.exists(skip_file_path):
-            with open(skip_file_path, 'r') as f:
+            with open(skip_file_path, 'r', encoding='utf-8') as f:
                 LOG.info("Found skip file %s with the following content:\n%s",
                          skip_file_path, f.read())
 
@@ -457,7 +465,7 @@ def assemble_zip(inputs,
 
     LOG.debug(f"Processing {len(analyzer_result_file_paths)} report files ...")
 
-    with MultiProcessPool() as executor:
+    with Pool() as executor:
         analyzer_result_file_reports = parse_analyzer_result_files(
              analyzer_result_file_paths, checker_labels, executor.map)
 
@@ -490,21 +498,22 @@ def assemble_zip(inputs,
             file_paths.update(report.original_files)
             file_report_positions[report.file.original_path].add(report.line)
 
-    files_to_delete = []
+    temp_dir = tempfile.mkdtemp('-unique-plists', dir=inputs[0])
     for dirname, analyzer_reports in unique_reports.items():
         for analyzer_name, reports in analyzer_reports.items():
             if not analyzer_name:
                 analyzer_name = 'unknown'
-            _, tmpfile = tempfile.mkstemp(f'-{analyzer_name}.plist')
+            tmpfile = os.path.join(
+                temp_dir, f'{uuid.uuid4()}-{analyzer_name}.plist')
 
             report_file.create(tmpfile, reports, checker_labels,
                                AnalyzerInfo(analyzer_name))
             LOG.debug(f"Stored '{analyzer_name}' unique reports in {tmpfile}.")
             files_to_compress[dirname].add(tmpfile)
-            files_to_delete.append(tmpfile)
 
     if changed_files:
         reports_helper.dump_changed_files(changed_files)
+        shutil.rmtree(temp_dir)
         sys.exit(1)
 
     if not file_paths:
@@ -593,14 +602,13 @@ def assemble_zip(inputs,
                     zipf, file_paths)
 
                 if stats.num_of_blame_information:
-                    LOG.info("Collecting blame information done.")
+                    LOG.info("Collecting blame information... Done.")
                 else:
                     LOG.info("No blame information found for source files.")
-            except NameError:
+            except NotImplementedError:
                 LOG.warning(
-                    "Collecting blame information has been failed. Make sure "
-                    "'git' is available on your system to hide this warning "
-                    "message.")
+                    "Failed to collect blame information. Make sure Git is "
+                    "installed on your system.")
 
         zipf.writestr('content_hashes.json', json.dumps(file_to_hash))
 
@@ -626,6 +634,7 @@ rerun the analysis to be able to store the results on the server.
 
 Configured report limit for this product: {p.reportLimit}
         """)
+        shutil.rmtree(temp_dir)
         sys.exit(1)
 
     zip_size = os.stat(zip_file).st_size
@@ -643,8 +652,7 @@ Configured report limit for this product: {p.reportLimit}
              sizeof_fmt(zip_size), sizeof_fmt(compressed_zip_size))
 
     # We are responsible for deleting these.
-    for file in files_to_delete:
-        os.remove(file)
+    shutil.rmtree(temp_dir)
 
 
 def should_be_zipped(input_file: str, input_files: Iterable[str]) -> bool:
@@ -738,7 +746,7 @@ def storing_analysis_statistics(client, inputs, run_name):
         if not statistics_files:
             LOG.debug("No analyzer statistics information can be found in the "
                       "report directory.")
-            return False
+            return None
 
         # Write statistics files to the ZIP file.
         with zipfile.ZipFile(zip_file, 'a', allowZip64=True) as zipf:
@@ -767,6 +775,8 @@ def storing_analysis_statistics(client, inputs, run_name):
     finally:
         os.close(zip_file_handle)
         os.remove(zip_file)
+
+    return None
 
 
 class WatchdogError(Exception):
@@ -806,12 +816,13 @@ def _timeout_watchdog(timeout: timedelta, trap: int):
     "pollable asynchronous store" feature is implemented, see:
     http://github.com/Ericsson/codechecker/issues/3672
     """
-    def _signal_handler(sig: int, frame):
+    def _signal_handler(sig: int, _):
         if sig == trap:
             signal.signal(trap, signal.SIG_DFL)
-            raise WatchdogError(timeout,
-                                "Timeout watchdog hit %d seconds (%s)"
-                                % (timeout.total_seconds(), str(timeout)))
+            raise WatchdogError(
+                timeout,
+                f"Timeout watchdog hit {timeout.total_seconds()} "
+                f"seconds ({str(timeout)})")
 
     pid = os.getpid()
     timer = Timer(timeout.total_seconds(),
@@ -848,7 +859,7 @@ def main(args):
         sys.exit(1)
 
     if not host_check.check_zlib():
-        raise Exception("zlib is not available on the system!")
+        raise ModuleNotFoundError("zlib is not available on the system!")
 
     # To ensure the help message prints the default folder properly,
     # the 'default' for 'args.input' is a string, not a list.
@@ -889,7 +900,16 @@ def main(args):
                                                  port,
                                                  product_name=product_name)
 
-    zip_file_handle, zip_file = tempfile.mkstemp('.zip')
+    try:
+        temp_dir = tempfile.mkdtemp(suffix="-store", dir=args.input[0])
+        LOG.debug(f"{temp_dir} directory created successfully!")
+    except PermissionError:
+        LOG.error(f"Permission denied! You do not have sufficient "
+                  f"permissions to create the {temp_dir} "
+                  "temporary directory.")
+        sys.exit(1)
+
+    zip_file_handle, zip_file = tempfile.mkstemp(suffix=".zip", dir=temp_dir)
     LOG.debug("Will write mass store ZIP to '%s'...", zip_file)
 
     try:
@@ -1002,3 +1022,5 @@ def main(args):
     finally:
         os.close(zip_file_handle)
         os.remove(zip_file)
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)

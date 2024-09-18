@@ -99,7 +99,8 @@ def get_location_by_offset(filename, offset):
     """
     This function returns the line and column number in the given file which
     is located at the given offset (i.e. number of characters including new
-    line characters).
+    line characters). None returns when the offset is greater than the file
+    length.
     """
     with open(filename, encoding='utf-8', errors='ignore') as f:
         for row, line in enumerate(f, 1):
@@ -108,6 +109,8 @@ def get_location_by_offset(filename, offset):
                 offset -= length
             else:
                 return row, offset + 1
+
+    return None
 
 
 def clang_tidy_fixit_filter(content, checker_names, file_paths, reports,
@@ -282,10 +285,14 @@ def apply_fixits(inputs, checker_names, file_paths, interactive, reports):
         """
         Execute clang-apply-replacements binary.
         """
+        context = analyzer_context.get_context()
+        replacer_env = context.get_env_for_bin(
+            analyzer_context.get_context().replacer_binary)
         subprocess.Popen([
             analyzer_context.get_context().replacer_binary,
             *ignore_flag,
-            out_dir]).communicate()
+            out_dir],
+            env=replacer_env).communicate()
 
     not_existing_files = set()
     existing_files = set()

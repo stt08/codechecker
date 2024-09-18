@@ -185,10 +185,11 @@ class PlistToHtmlTest(unittest.TestCase):
         output_dir = self.__test_html_builder('inclusion')
         index_html = os.path.join(output_dir, "index.html")
 
-        report_count = 0
         with open(index_html, 'r', encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if re.search("<td file=", line):
-                    report_count += 1
+            content = f.read()
 
-        self.assertEqual(report_count, 3)
+            # There are 3 reports in the test file.
+            self.assertEqual(len(re.findall('"link": "', content)), 3)
+            # The links should be relative so the static HTML folder is
+            # portable.
+            self.assertNotIn('"link": "/', content)

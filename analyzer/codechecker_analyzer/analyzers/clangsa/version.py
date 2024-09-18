@@ -51,7 +51,7 @@ class ClangVersionInfoParser:
         """Try to parse the version string using the predefined patterns."""
         version_match = re.search(self.clang_version_pattern, version_string)
         if not version_match:
-            return
+            return None
 
         installed_dir_match = re.search(
             self.clang_installed_dir_pattern, version_string)
@@ -77,7 +77,7 @@ def get(clang_binary):
     """
     compiler_version = subprocess.check_output(
         [clang_binary, '--version'],
-        env=analyzer_context.get_context().analyzer_env,
+        env=analyzer_context.get_context().get_env_for_bin(clang_binary),
         encoding="utf-8",
         errors="ignore")
     version_parser = ClangVersionInfoParser(clang_binary)

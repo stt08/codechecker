@@ -29,7 +29,8 @@ from codechecker_common.output import USER_FORMATS
 DEFAULT_FILTER_VALUES = {
     'review_status': ['unreviewed', 'confirmed'],
     'detection_status': ['new', 'reopened', 'unresolved'],
-    'uniqueing': 'off'
+    'uniqueing': 'off',
+    'anywhere_on_report_path': False
 }
 
 DEFAULT_OUTPUT_FORMATS = ["plaintext"] + USER_FORMATS
@@ -424,6 +425,15 @@ def __add_filtering_arguments(parser, defaults=None, diff_mode=False):
                               "\"time\" part can be omitted, in which case "
                               "midnight (00:00:00) is used).")
 
+    f_group.add_argument('--anywhere-on-report-path',
+                         dest='anywhere_on_report_path',
+                         required=False,
+                         default=init_default('anywhere_on_report_path'),
+                         action="store_true",
+                         help="Filter reports where the report path not only "
+                              "ends in the files given by --file or "
+                              "--component, but goes through them.")
+
 
 def __register_results(parser):
     """
@@ -760,12 +770,12 @@ def __register_products(parser):
 
         dbmodes = dbmodes.add_mutually_exclusive_group(required=False)
 
-        SQLITE_PRODUCT_ENDPOINT_DEFAULT_VAR = '<ENDPOINT>.sqlite'
+        sqlite_product_endpoint_default_var = '<ENDPOINT>.sqlite'
         dbmodes.add_argument('--sqlite',
                              type=str,
                              dest="sqlite",
                              metavar='SQLITE_FILE',
-                             default=SQLITE_PRODUCT_ENDPOINT_DEFAULT_VAR,
+                             default=sqlite_product_endpoint_default_var,
                              required=False,
                              help="Path of the SQLite database file to use. "
                                   "Not absolute paths will be relative to "
@@ -781,7 +791,7 @@ def __register_products(parser):
                                   "\"PostgreSQL arguments\" section on how "
                                   "to configure the database connection.")
 
-        PGSQL_PRODUCT_ENDPOINT_DEFAULT_VAR = '<ENDPOINT>'
+        pgsql_product_endpoint_default_var = '<ENDPOINT>'
         pgsql = parser.add_argument_group(
             "PostgreSQL arguments",
             "Values of these arguments are ignored, unless '--postgresql' is "
@@ -809,7 +819,7 @@ def __register_products(parser):
         pgsql.add_argument('--dbusername', '--db-username',
                            type=str,
                            dest="dbusername",
-                           default=PGSQL_PRODUCT_ENDPOINT_DEFAULT_VAR,
+                           default=pgsql_product_endpoint_default_var,
                            required=False,
                            help="Username to use for connection.")
 
@@ -824,7 +834,7 @@ def __register_products(parser):
         pgsql.add_argument('--dbname', '--db-name',
                            type=str,
                            dest="dbname",
-                           default=PGSQL_PRODUCT_ENDPOINT_DEFAULT_VAR,
+                           default=pgsql_product_endpoint_default_var,
                            required=False,
                            help="Name of the database to use.")
 
@@ -837,8 +847,8 @@ def __register_products(parser):
                 that are present in the invocation argv."""
                 matched_args = []
                 for option in options:
-                    if any([arg if option.startswith(arg) else None
-                            for arg in sys.argv[1:]]):
+                    if any(arg if option.startswith(arg) else None
+                           for arg in sys.argv[1:]):
                         matched_args.append(option)
                         continue
 
@@ -853,21 +863,21 @@ def __register_products(parser):
             psql_args_matching = arg_match(options)
             if any(psql_args_matching) and \
                     'postgresql' not in args:
-                first_matching_arg = next(iter([match for match
-                                                in psql_args_matching]))
-                parser.error("argument {0}: not allowed without argument "
-                             "--postgresql".format(first_matching_arg))
+                first_matching_arg = \
+                    next(match for match in psql_args_matching)
+                parser.error(f"argument {first_matching_arg}: not allowed "
+                             "without argument --postgresql")
                 # parser.error() terminates with return code 2.
 
             # Some arguments get a dynamic default value that depends on the
             # value of another argument.
-            if args.sqlite == SQLITE_PRODUCT_ENDPOINT_DEFAULT_VAR:
+            if args.sqlite == sqlite_product_endpoint_default_var:
                 args.sqlite = args.endpoint + '.sqlite'
 
-            if args.dbusername == PGSQL_PRODUCT_ENDPOINT_DEFAULT_VAR:
+            if args.dbusername == pgsql_product_endpoint_default_var:
                 args.dbusername = args.endpoint
 
-            if args.dbname == PGSQL_PRODUCT_ENDPOINT_DEFAULT_VAR:
+            if args.dbname == pgsql_product_endpoint_default_var:
                 args.dbname = args.endpoint
 
             if 'postgresql' not in args:

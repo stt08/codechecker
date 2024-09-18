@@ -6,8 +6,8 @@ from git import Repo
 from git.exc import InvalidGitRepositoryError, GitCommandError
 from typing import Dict, Iterable, Optional
 
+from codechecker_common.compatibility.multiprocessing import Pool
 from codechecker_common.logger import get_logger
-from codechecker_common.multiprocesspool import MultiProcessPool
 
 LOG = get_logger('system')
 
@@ -41,13 +41,13 @@ def __get_blame_info(file_path: str):
     try:
         repo = Repo(file_path, search_parent_directories=True)
         if repo.ignored(file_path):
-            LOG.debug(f"File {file_path} is an ignored file")
-            return
+            LOG.debug("File %s is an ignored file", file_path)
+            return None
     except InvalidGitRepositoryError:
-        return
+        return None
     except GitCommandError as ex:
-        LOG.debug(f"Failed to get blame information for {file_path}: {ex}")
-        return
+        LOG.debug("Failed to get blame information for %s: %s", file_path, ex)
+        return None
 
     tracking_branch = __get_tracking_branch(repo)
 
@@ -92,6 +92,8 @@ def __get_blame_info(file_path: str):
     except Exception as ex:
         LOG.debug("Failed to get blame information for %s: %s", file_path, ex)
 
+    return None
+
 
 def __collect_blame_info_for_files(
     file_paths: Iterable[str],
@@ -115,7 +117,7 @@ def assemble_blame_info(
 
     Returns the number of collected blame information.
     """
-    with MultiProcessPool() as executor:
+    with Pool() as executor:
         file_blame_info = __collect_blame_info_for_files(
             file_paths, executor.map)
 

@@ -132,6 +132,7 @@ subcommand.
 ```
 usage: CodeChecker check [-h] [-o OUTPUT_DIR] [-t {plist}] [-q]
                          [--keep-gcc-include-fixed] [--keep-gcc-intrin]
+                         [--add-gcc-include-dirs-with-isystem]
                          (-b COMMAND | -l LOGFILE) [-j JOBS] [-c]
                          [--compile-uniqueing COMPILE_UNIQUEING]
                          [--report-hash {context-free,context-free-v2,diagnostic-message}]
@@ -179,6 +180,11 @@ optional arguments:
                         be kept among the implicit include paths. Use this
                         flag if Clang analysis fails with error message
                         related to __builtin symbols. (default: False)
+  --add-gcc-include-dirs-with-isystem
+                        Implicit include directories are appended to the
+                        analyzer command with -idirafter. If -isystem is needed
+                        instead, as it was used before CodeChecker 6.24.1, this
+                        flag can be used. (default: False)
   --compile-uniqueing COMPILE_UNIQUEING
                         Specify the method the compilation actions in the
                         compilation database are uniqued before analysis. CTU
@@ -483,7 +489,7 @@ Environment variables for 'CodeChecker log' command:
   CC_LOGGER_GCC_LIKE       Set to to a colon separated list to change which
                            compilers should be logged. For example (default):
                            export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:
-                           cc:c++". The logger will match any compilers with
+                           /cc:c++". The logger will match any compilers with
                            'gcc', 'g++', 'clang', 'clang++', 'cc' and 'c++' in
                            their filenames.
   CC_LOGGER_KEEP_LINK      If its value is not 'true' then object files will be
@@ -682,7 +688,7 @@ Environment variables
   CC_LOGGER_GCC_LIKE       Set to to a colon separated list to change which
                            compilers should be logged. For example (default):
                            export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:
-                           cc:c++". The logger will match any compilers with
+                           /cc:c++". The logger will match any compilers with
                            'gcc', 'g++', 'clang', 'clang++', 'cc' and 'c++' in
                            their filenames.
   CC_LOGGER_KEEP_LINK      If its value is not 'true' then object files will be
@@ -707,7 +713,7 @@ Set `CC_LOGGER_GCC_LIKE` environment variable to a colon separated list.
 For example (default):
 
 ```sh
-export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:cc:c++"
+export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:/cc:c++"
 ```
 
 This colon separated list may contain compiler names or paths. In case an
@@ -716,7 +722,7 @@ considered a path. The logger will capture only those build actions which have
 this postfix:
 
 ```sh
-export CC_LOGGER_GCC_LIKE="gcc:/bin/g++:clang:clang++:cc:c++"
+export CC_LOGGER_GCC_LIKE="gcc:/bin/g++:clang:clang++:/cc:c++"
 
 # "gcc" has to be infix of the compiler's name because it contains no slash.
 # "/bin/g++" has to be postfix of the compiler's path because it contains slash.
@@ -730,6 +736,9 @@ my/gcc/compiler/gcc-7 main.c  # Captured because "gcc" is infix of "gcc-7".
 /clang # Will not log clang++ calls only the clang binary calls will be captured.
 clang  # Will capture clang-tidy (which is not wanted) calls too because of a partial match.
 ```
+
+The reason of having a slash before `cc` is that `cc1` binary is executed as
+a sub-process by some compilers and that shouldn't be captured.
 
 Example:
 
@@ -752,6 +761,16 @@ build actions (i.e. those which don't perform compilation but contain only
 object files as input) should be captured. For further details see
 [this documentation](/analyzer/tools/build-logger/README.md).
 
+
+If your build tool overrides `LD_LIBRARY_PATH` during the build process, then
+`ldlogger.so` will not be found. The best solution is to making sure
+that the LD_LIBRARY_PATH is not overridden, only extended.
+If this is not possible, you can work around the situation by
+specifying the absolute path of the `ldlogger.so` in the `LD_PRELOAD`:
+
+```sh
+LD_PRELOAD=<CODECHECKER_DIR>/ld_logger/lib/x86_64/ldlogger.so CodeChecker log -o compile_commands.json -b "make -j2"
+```
 
 #### Change user inside the build command
 If we change user inside the build command of the CodeChecker log command
@@ -918,6 +937,7 @@ usage: CodeChecker analyze [-h] [-j JOBS]
                            OUTPUT_PATH
                            [--compiler-info-file COMPILER_INFO_FILE]
                            [--keep-gcc-include-fixed] [--keep-gcc-intrin]
+                           [--add-gcc-include-dirs-with-isystem]
                            [-t {plist}] [-q] [-c]
                            [--compile-uniqueing COMPILE_UNIQUEING]
                            [--report-hash {context-free,context-free-v2,diagnostic-message}]
@@ -977,6 +997,11 @@ optional arguments:
                         be kept among the implicit include paths. Use this
                         flag if Clang analysis fails with error message
                         related to __builtin symbols. (default: False)
+  --add-gcc-include-dirs-with-isystem
+                        Implicit include directories are appended to the
+                        analyzer command with -idirafter. If -isystem is needed
+                        instead, as it was used before CodeChecker 6.24.1, this
+                        flag can be used. (default: False)
   -t {plist}, --type {plist}, --output-format {plist}
                         Specify the format the analysis results should use.
                         (default: plist)
@@ -1352,7 +1377,7 @@ CodeChecker will get the hardcoded values for the compilers set in the
 `CC_LOGGER_GCC_LIKE` environment variable.
 
 ```sh
-export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:cc:c++"
+export CC_LOGGER_GCC_LIKE="gcc:g++:clang:clang++:/cc:c++"
 ```
 
 GCC specific hard-coded values are detected during the analysis and
@@ -1371,6 +1396,14 @@ cause failure in analysis. CodeChecker omits these GCC-specific paths from the
 analysis unless `--keep-gcc-include-fixed` or `--keep-gcc-intrin` flag is
 given. For further information see
 [GCC incompatibilities](gcc_incompatibilities.md).
+
+The GCC compiler's implicit include directories are appended to the analyzer
+command with `-idirafter`. There are other flags which can be used instead of
+`-idirafter`, such as , `-I`, `-isystem`, etc. They have a
+[priority order](https://gcc.gnu.org/onlinedocs/gcc/Directory-Options.html) in
+which compilers search header files. Prior to CodeChecker 6.24.1, the
+`-isystem` flag was used instead of `-idirafter`. If you need to the `-isystem`
+flag, you can use the `--add-gcc-include-dirs-with-isystem` flag.
 
 #### Toggling checkers
 

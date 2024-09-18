@@ -28,11 +28,11 @@ test: pycodestyle pylint test_unit test_functional
 test_in_env: pycodestyle_in_env pylint_in_env test_unit_in_env test_functional_novenv
 
 PYCODESTYLE_TEST_CMD = pycodestyle \
-  --exclude=server/codechecker_server/migrations \
-  codechecker_web tests \
+  codechecker_web \
+  tests \
   client/codechecker_client \
-  server/codechecker_server server/tests \
-  tests
+  server/codechecker_server \
+  server/tests
 
 pycodestyle:
 	$(PYCODESTYLE_TEST_CMD)
@@ -43,10 +43,9 @@ pycodestyle_in_env: venv_dev
 PYLINT_TEST_CMD = PYLINTRC=$(ROOT)/.pylintrc \
   pylint -j0 \
     --ignore=server/codechecker_server/migrations/report,server/codechecker_server/migrations/report/versions,server/codechecker_server/migrations/config,server/codechecker_server/migrations/config/versions \
-    ./bin/** \
     ./codechecker_web \
-    ./client/bin/** ./client/codechecker_client \
-    ./server/bin/** ./server/codechecker_server ./server/tests/unit \
+    ./client/codechecker_client \
+    ./server/codechecker_server ./server/tests/unit \
     ./tests/functional ./tests/libtest ./tests/tools \
     $(ROOT)/tools/report-converter/codechecker_report_converter
 

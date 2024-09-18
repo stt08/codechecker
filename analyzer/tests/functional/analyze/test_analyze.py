@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import shlex
 import unittest
 import zipfile
 
@@ -46,7 +47,7 @@ class TestAnalyze(unittest.TestCase):
         print("Removing: " + TEST_WORKSPACE)
         shutil.rmtree(TEST_WORKSPACE)
 
-    def setup_method(self, method):
+    def setup_method(self, _):
         """Setup the environment for the tests."""
 
         self.test_workspace = os.environ['TEST_WORKSPACE']
@@ -62,13 +63,16 @@ class TestAnalyze(unittest.TestCase):
         self.__old_pwd = os.getcwd()
         os.chdir(self.test_dir)
 
-        self.missing_checker_regex = re.compile(
-            r"No checker\(s\) with these names was found")
+        self.warn_missing_checker_regex = re.compile(
+            r"WARNING.*No checker\(s\) with these names was found")
+
+        self.err_missing_checker_regex = re.compile(
+            r"ERROR.*No checker\(s\) with these names was found")
 
         self.disabling_modeling_checker_regex = re.compile(
             r"analyzer-disable-checker=.*unix.cstring.CStringModeling.*")
 
-    def teardown_method(self, method):
+    def teardown_method(self, _):
         """Restore environment after tests have ran."""
         os.chdir(self.__old_pwd)
         if os.path.isdir(self.report_dir):
@@ -190,20 +194,20 @@ class TestAnalyze(unittest.TestCase):
         errcode = process.returncode
         self.assertEqual(errcode, 0)
 
-        info_File = os.path.join(reports_dir, 'compiler_info.json')
-        self.assertEqual(os.path.exists(info_File), True)
-        self.assertNotEqual(os.stat(info_File).st_size, 0)
+        info_file = os.path.join(reports_dir, 'compiler_info.json')
+        self.assertEqual(os.path.exists(info_file), True)
+        self.assertNotEqual(os.stat(info_file).st_size, 0)
 
         # Test the validity of the json files.
-        with open(info_File, 'r', encoding="utf-8", errors="ignore") as f:
+        with open(info_file, 'r', encoding="utf-8", errors="ignore") as f:
             try:
                 data = json.load(f)
                 self.assertEqual(len(data), 1)
                 # For clang we do not collect anything.
                 self.assertTrue("g++" in data)
             except ValueError:
-                self.fail("json.load should successfully parse the file %s"
-                          % info_File)
+                self.fail("json.load should successfully parse "
+                          f"the file {info_file}")
 
     def test_compiler_info_file_is_loaded(self):
         '''
@@ -259,7 +263,7 @@ class TestAnalyze(unittest.TestCase):
         print(out)
         self.assertTrue("-std=FAKE_STD" in out)
         self.assertTrue("--target=FAKE_TARGET" in out)
-        self.assertTrue("-isystem /FAKE_INCLUDE_DIR" in out)
+        self.assertTrue("-idirafter /FAKE_INCLUDE_DIR" in out)
 
     def test_capture_analysis_output(self):
         """
@@ -633,7 +637,6 @@ class TestAnalyze(unittest.TestCase):
         is_b: bool,
         is_s: bool
     ):
-        """ """
         with open(compilation_db_file_path,
                   encoding="utf-8", errors="ignore") as json_file:
             data = json.load(json_file)
@@ -781,24 +784,11 @@ class TestAnalyze(unittest.TestCase):
         self.assertFalse(os.path.isdir(failed_dir))
         self.check_unique_compilation_db(unique_json, 3, True, True, True)
 
-    def __run_with_invalid_enabled_checker_name(self, extra_args):
-        build_json = os.path.join(self.test_workspace, "build_success.json")
-        analyze_cmd = [self._codechecker_cmd, "analyze", build_json,
-                       "--analyzers", "clangsa", "-o", self.report_dir,
-                       "-e", "non-existing-checker-name"]
-        analyze_cmd.extend(extra_args)
+    def __run_with_invalid_checker_name(self, codechecker_subcommand,
+                                        extra_args):
+        analyze_cmd = codechecker_subcommand + extra_args
 
-        source_file = os.path.join(self.test_dir, "success.c")
-        build_log = [{"directory": self.test_workspace,
-                      "command": "gcc -c " + source_file,
-                      "file": source_file
-                      }]
-
-        with open(build_json, 'w',
-                  encoding="utf-8", errors="ignore") as outfile:
-            json.dump(build_log, outfile)
-
-        print(analyze_cmd)
+        print(shlex.join(analyze_cmd))
         process = subprocess.Popen(
             analyze_cmd,
             stdout=subprocess.PIPE,
@@ -809,11 +799,53 @@ class TestAnalyze(unittest.TestCase):
         out, err = process.communicate()
         return out, err, process.returncode
 
+    def __run_with_invalid_enabled_checker_name_common(self,
+                                                       codechecker_subcommand,
+                                                       extra_args):
+        return self.__run_with_invalid_checker_name(
+            codechecker_subcommand + ["--analyzers", "clangsa", "-o",
+                                      self.report_dir, "-c", "-e",
+                                      "non-existing-checker-name"], extra_args)
+
+    def __get_build_json(self):
+        build_json = os.path.join(self.test_workspace, "build_success.json")
+        source_file = os.path.join(self.test_dir, "success.c")
+        build_log = [{
+            "directory": self.test_workspace,
+            "command": "gcc -c " + source_file,
+            "file": source_file}]
+        with open(build_json, 'w',
+                  encoding="utf-8", errors="ignore") as outfile:
+            json.dump(build_log, outfile)
+        return build_json
+
+    def __run_with_invalid_enabled_checker_name_check(self, extra_args):
+        codechecker_subcommand = [self._codechecker_cmd, "check", "-l",
+                                  self.__get_build_json()]
+        return self.__run_with_invalid_enabled_checker_name_common(
+                codechecker_subcommand, extra_args)
+
+    def __run_with_invalid_enabled_checker_name_analyze(self, extra_args):
+        codechecker_subcommand = [self._codechecker_cmd, "analyze",
+                                  self.__get_build_json()]
+        return self.__run_with_invalid_enabled_checker_name_common(
+                codechecker_subcommand, extra_args)
+
     def test_invalid_enabled_checker_name(self):
         """Error out in case of an invalid enabled checker."""
-        out, _, errcode = self.__run_with_invalid_enabled_checker_name([])
+        out, _, errcode = \
+            self.__run_with_invalid_enabled_checker_name_check([])
 
-        match = self.missing_checker_regex.search(out)
+        match = self.err_missing_checker_regex.search(out)
+        self.assertIsNotNone(match)
+        self.assertTrue("non-existing-checker-name" in out)
+
+        self.assertEqual(errcode, 1)
+
+        out, _, errcode = \
+            self.__run_with_invalid_enabled_checker_name_analyze([])
+
+        match = self.err_missing_checker_regex.search(out)
         self.assertIsNotNone(match)
         self.assertTrue("non-existing-checker-name" in out)
 
@@ -824,14 +856,28 @@ class TestAnalyze(unittest.TestCase):
         Warn in case of an invalid enabled checker when using
         --no-missing-checker-error.
         """
-        out, _, errcode = self.__run_with_invalid_enabled_checker_name(
+        out, _, errcode = self.__run_with_invalid_enabled_checker_name_analyze(
             ['--no-missing-checker-error'])
 
-        match = self.missing_checker_regex.search(out)
+        match = self.warn_missing_checker_regex.search(out)
         self.assertIsNotNone(match)
         self.assertTrue("non-existing-checker-name" in out)
 
         self.assertEqual(errcode, 0)
+
+        out, _, errcode = self.__run_with_invalid_enabled_checker_name_check(
+            ['--no-missing-checker-error'])
+
+        print(out)
+        match = self.warn_missing_checker_regex.search(out)
+        self.assertIsNotNone(match)
+        self.assertTrue("non-existing-checker-name" in out)
+
+        # FIXME: Interestingly, CodeChecker analyze doesn't find the bug in the
+        # code, but CodeChecker check does, so the return value is 2 here
+        # instead of 0. Lets just check that its not a CodeChecker error (which
+        # would be a return code of 1).
+        self.assertNotEqual(errcode, 1)
 
     def test_disable_all_warnings(self):
         """Test disabling warnings as checker groups."""
@@ -865,39 +911,41 @@ class TestAnalyze(unittest.TestCase):
         self.assertIn("unused variable 'i' [clang-diagnostic-unused-variable]",
                       out)
 
-    def __run_with_invalid_disabled_checker_name(self, extra_args):
-        build_json = os.path.join(self.test_workspace, "build_success.json")
-        analyze_cmd = [self._codechecker_cmd, "analyze", build_json,
-                       "--analyzers", "clangsa", "-o", self.report_dir,
-                       "-d", "non-existing-checker-name"]
-        analyze_cmd.extend(extra_args)
+    def __run_with_invalid_disabled_checker_name_common(self,
+                                                        codechecker_subcommand,
+                                                        extra_args):
+        return self.__run_with_invalid_checker_name(
+            codechecker_subcommand + ["--analyzers", "clangsa", "-o",
+                                      self.report_dir, "-c", "-d",
+                                      "non-existing-checker-name"], extra_args)
 
-        source_file = os.path.join(self.test_dir, "success.c")
-        build_log = [{"directory": self.test_workspace,
-                      "command": "gcc -c " + source_file,
-                      "file": source_file
-                      }]
+    def __run_with_invalid_disabled_checker_name_check(self, extra_args):
+        codechecker_subcommand = [self._codechecker_cmd, "check", "-l",
+                                  self.__get_build_json()]
+        return self.__run_with_invalid_disabled_checker_name_common(
+                codechecker_subcommand, extra_args)
 
-        with open(build_json, 'w',
-                  encoding="utf-8", errors="ignore") as outfile:
-            json.dump(build_log, outfile)
-
-        print(analyze_cmd)
-        process = subprocess.Popen(
-            analyze_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=self.test_dir,
-            encoding="utf-8",
-            errors="ignore")
-        out, err = process.communicate()
-        return out, err, process.returncode
+    def __run_with_invalid_disabled_checker_name_analyze(self, extra_args):
+        codechecker_subcommand = [self._codechecker_cmd, "analyze",
+                                  self.__get_build_json()]
+        return self.__run_with_invalid_disabled_checker_name_common(
+                codechecker_subcommand, extra_args)
 
     def test_invalid_disabled_checker_name(self):
         """Error out in case of an invalid disabled checker."""
-        out, _, errcode = self.__run_with_invalid_disabled_checker_name([])
+        out, _, errcode = \
+            self.__run_with_invalid_disabled_checker_name_analyze([])
 
-        match = self.missing_checker_regex.search(out)
+        match = self.err_missing_checker_regex.search(out)
+        self.assertIsNotNone(match)
+        self.assertTrue("non-existing-checker-name" in out)
+
+        self.assertEqual(errcode, 1)
+
+        out, _, errcode = \
+            self.__run_with_invalid_disabled_checker_name_check([])
+
+        match = self.err_missing_checker_regex.search(out)
         self.assertIsNotNone(match)
         self.assertTrue("non-existing-checker-name" in out)
 
@@ -908,14 +956,28 @@ class TestAnalyze(unittest.TestCase):
         Warn in case of an invalid disabled checker when using
         --no-missing-checker-error.
         """
-        out, _, errcode = self.__run_with_invalid_disabled_checker_name(
-            ['--no-missing-checker-error'])
+        out, _, errcode = \
+            self.__run_with_invalid_disabled_checker_name_analyze(
+                ['--no-missing-checker-error'])
 
-        match = self.missing_checker_regex.search(out)
+        match = self.warn_missing_checker_regex.search(out)
         self.assertIsNotNone(match)
         self.assertTrue("non-existing-checker-name" in out)
 
         self.assertEqual(errcode, 0)
+
+        out, _, errcode = self.__run_with_invalid_disabled_checker_name_check(
+            ['--no-missing-checker-error'])
+
+        match = self.warn_missing_checker_regex.search(out)
+        self.assertIsNotNone(match)
+        self.assertTrue("non-existing-checker-name" in out)
+
+        # FIXME: Interestingly, CodeChecker analyze doesn't find the bug in the
+        # code, but CodeChecker check does, so the return value is 2 here
+        # instead of 0. Lets just check that its not a CodeChecker error (which
+        # would be a return code of 1).
+        self.assertNotEqual(errcode, 1)
 
     def test_disabling_clangsa_modeling_checkers(self):
         """Warn in case a modeling checker is disabled from clangsa"""
@@ -980,7 +1042,7 @@ class TestAnalyze(unittest.TestCase):
             errors="ignore")
         out, _ = process.communicate()
 
-        match = self.missing_checker_regex.search(out)
+        match = self.err_missing_checker_regex.search(out)
         self.assertIsNotNone(match)
         self.assertTrue("non-existing-checker-name" in out)
         self.assertTrue("non-existing-checker" in out)
@@ -1017,6 +1079,7 @@ class TestAnalyze(unittest.TestCase):
         out = subprocess.run(analyze_cmd,
                              cwd=self.test_dir,
                              # env=self.env,
+                             check=False,
                              stdout=subprocess.PIPE).stdout.decode()
 
         # Test correct handover.
@@ -1037,6 +1100,7 @@ class TestAnalyze(unittest.TestCase):
         out = subprocess.run(analyze_cmd,
                              cwd=self.test_dir,
                              # env=self.env,
+                             check=False,
                              stdout=subprocess.PIPE).stdout.decode()
 
         # Test if the standard is correctly transformed
@@ -1162,6 +1226,7 @@ class TestAnalyze(unittest.TestCase):
             encoding="utf-8",
             errors="ignore")
         out, _ = process.communicate()
+        print(out)
 
         # It's printed as a found report and in the checker statistics.
         # Note: If this test case fails, its pretty sure that something totally
@@ -1187,8 +1252,6 @@ class TestAnalyze(unittest.TestCase):
             errors="ignore")
         out, _ = process.communicate()
 
-        # It's printed as the member of enabled checkers at the beginning
-        # of the output, a found report and in the checker statistics.
         self.assertEqual(out.count('hicpp-use-nullptr'), 3)
 
         analyze_cmd = [self._codechecker_cmd, "check", "-l", build_json,
@@ -1207,9 +1270,7 @@ class TestAnalyze(unittest.TestCase):
             errors="ignore")
         out, _ = process.communicate()
         print(out)
-        # It's printed as the member of enabled checkers at the beginning
-        # of the output, a found report and in the checker statistics.
-        self.assertEqual(out.count('UninitializedObject'), 3)
+        self.assertEqual(out.count('UninitializedObject'), 2)
 
         analyze_cmd = [self._codechecker_cmd, "check", "-l", build_json,
                        "--analyzers", "clangsa", "-o", self.report_dir,
@@ -1230,9 +1291,7 @@ class TestAnalyze(unittest.TestCase):
         out, _ = process.communicate()
 
         print(out)
-        # It is printed as the member of enabled checkers, but it gives no
-        # report.
-        self.assertEqual(out.count('UninitializedObject'), 1)
+        self.assertEqual(out.count('UninitializedObject'), 0)
 
     def test_invalid_compilation_database(self):
         """ Warn in case of an invalid enabled checker. """

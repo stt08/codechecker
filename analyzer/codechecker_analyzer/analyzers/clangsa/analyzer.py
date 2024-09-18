@@ -51,7 +51,8 @@ def parse_clang_help_page(
         help_page = subprocess.check_output(
             command,
             stderr=subprocess.STDOUT,
-            env=analyzer_context.get_context().analyzer_env,
+            env=analyzer_context.get_context()
+            .get_env_for_bin(command[0]),
             universal_newlines=True,
             encoding="utf-8",
             errors="ignore")
@@ -121,7 +122,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
     __ctu_autodetection = None
 
     def __init__(self, cfg_handler, buildaction):
-        super(ClangSA, self).__init__(cfg_handler, buildaction)
+        super().__init__(cfg_handler, buildaction)
         self.__disable_ctu = False
         self.__checker_configs = []
         self.__disabled_checkers = []
@@ -171,17 +172,20 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             analyzer_cmd.extend(["-load", plugin])
 
     @classmethod
-    def get_binary_version(self, environ, details=False) -> str:
+    def get_binary_version(cls, details=False) -> str:
         # No need to LOG here, we will emit a warning later anyway.
-        if not self.analyzer_binary():
+
+        environ = analyzer_context.get_context().get_env_for_bin(
+            cls.analyzer_binary())
+        if not cls.analyzer_binary():
             return None
 
         if details:
-            version = [self.analyzer_binary(), '--version']
+            ver = [cls.analyzer_binary(), '--version']
         else:
-            version = [self.analyzer_binary(), '-dumpversion']
+            ver = [cls.analyzer_binary(), '-dumpversion']
         try:
-            output = subprocess.check_output(version,
+            output = subprocess.check_output(ver,
                                              env=environ,
                                              universal_newlines=True,
                                              encoding="utf-8",
@@ -189,7 +193,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             return output.strip()
         except (subprocess.CalledProcessError, OSError) as oerr:
             LOG.warning("Failed to get analyzer version: %s",
-                        ' '.join(version))
+                        ' '.join(ver))
             LOG.warning(oerr)
 
         return None
@@ -207,7 +211,8 @@ class ClangSA(analyzer_base.SourceAnalyzer):
         if not cls.__ctu_autodetection:
             cls.__ctu_autodetection = CTUAutodetection(
                 cls.analyzer_binary(),
-                analyzer_context.get_context().analyzer_env)
+                analyzer_context.get_context()
+                .get_env_for_bin(cls.analyzer_binary()))
 
         return cls.__ctu_autodetection
 
@@ -405,9 +410,9 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             enabled_checkers = []
             for checker_name, value in config.checks().items():
                 state, _ = value
-                if state == CheckerState.enabled:
+                if state == CheckerState.ENABLED:
                     enabled_checkers.append(checker_name)
-                elif state == CheckerState.disabled:
+                elif state == CheckerState.DISABLED:
                     self.__disabled_checkers.append(checker_name)
 
             if enabled_checkers:
@@ -473,7 +478,8 @@ class ClangSA(analyzer_base.SourceAnalyzer):
             analyzer_cmd.extend(self.buildaction.analyzer_options)
 
             analyzer_cmd.extend(prepend_all(
-                '-isystem',
+                '-isystem' if config.add_gcc_include_dirs_with_isystem else
+                '-idirafter',
                 self.buildaction.compiler_includes))
 
             analyzer_cmd.append(self.source_file)
@@ -584,7 +590,7 @@ class ClangSA(analyzer_base.SourceAnalyzer):
         return clang
 
     @classmethod
-    def is_binary_version_incompatible(cls, environ):
+    def is_binary_version_incompatible(cls):
         """
         We support pretty much every ClangSA version.
         """
@@ -606,7 +612,8 @@ class ClangSA(analyzer_base.SourceAnalyzer):
     def construct_config_handler(cls, args):
 
         context = analyzer_context.get_context()
-        environ = context.analyzer_env
+        environ = context.get_env_for_bin(
+            cls.analyzer_binary())
 
         handler = config_handler.ClangSAConfigHandler(environ)
 
@@ -617,6 +624,10 @@ class ClangSA(analyzer_base.SourceAnalyzer):
 
         handler.enable_z3_refutation = 'enable_z3_refutation' in args and \
             args.enable_z3_refutation == 'on'
+
+        handler.add_gcc_include_dirs_with_isystem = \
+            'add_gcc_include_dirs_with_isystem' in args and \
+            args.add_gcc_include_dirs_with_isystem
 
         if 'ctu_phases' in args:
             handler.ctu_dir = os.path.join(args.output_path,

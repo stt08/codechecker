@@ -8,9 +8,9 @@
 
 
 from collections import namedtuple
-# pylint: disable=no-name-in-module
-from distutils.spawn import find_executable
+from shutil import which
 from enum import Enum
+from pathlib import Path
 
 import glob
 import json
@@ -78,6 +78,7 @@ IGNORED_OPTIONS_GCC = [
     '-ffixed-r2',
     '-ffp$',
     '-mfp16-format',
+    '-mmitigate-rop',
     '-fgcse-lm',
     '-fhoist-adjacent-loads',
     '-findirect-inlining',
@@ -93,10 +94,12 @@ IGNORED_OPTIONS_GCC = [
     '-fno-delete-null-pointer-checks',
     '-fno-defer-pop',
     '-fno-extended-identifiers',
+    '-fno-freestanding',
     '-fno-jump-table',
     '-fno-keep-inline-dllexport'
     '-fno-keep-static-consts',
     '-fno-lifetime-dse',
+    '-f(no-)?printf-return-value',
     '-f(no-)?reorder-functions',
     '-fno-strength-reduce',
     '-fno-toplevel-reorder',
@@ -340,7 +343,7 @@ class ImplicitCompilerInfo:
     def is_executable_compiler(compiler):
         if compiler not in ImplicitCompilerInfo.compiler_isexecutable:
             ImplicitCompilerInfo.compiler_isexecutable[compiler] = \
-                find_executable(compiler) is not None
+                which(compiler) is not None
 
         return ImplicitCompilerInfo.compiler_isexecutable[compiler]
 
@@ -372,6 +375,7 @@ class ImplicitCompilerInfo:
             LOG.error(
                 "Error during process execution: %s\n%s\n",
                 ' '.join(map(shlex.quote, cmd)), oerr.strerror)
+            return None
 
     @staticmethod
     def __parse_compiler_includes(compile_cmd: List[str]):
@@ -430,8 +434,7 @@ class ImplicitCompilerInfo:
         LOG.debug(
             "Retrieving default includes via %s",
             ' '.join(map(shlex.quote, cmd)))
-        ICI = ImplicitCompilerInfo
-        include_dirs = ICI.__parse_compiler_includes(cmd)
+        include_dirs = ImplicitCompilerInfo.__parse_compiler_includes(cmd)
 
         return list(map(os.path.normpath, include_dirs))
 
@@ -473,7 +476,7 @@ class ImplicitCompilerInfo:
                     is fetched.
         language -- The programming lenguage being compiled (e.g. 'c' or 'c++')
         """
-        VERSION_C = """
+        version_c = """
 #ifdef __STDC_VERSION__
 #  if __STDC_VERSION__ >= 201710L
 #    error CC_FOUND_STANDARD_VER#17
@@ -491,7 +494,7 @@ class ImplicitCompilerInfo:
 #endif
         """
 
-        VERSION_CPP = """
+        version_cpp = """
 #ifdef __cplusplus
 #  if __cplusplus >= 201703L
 #    error CC_FOUND_STANDARD_VER#17
@@ -516,7 +519,7 @@ class ImplicitCompilerInfo:
                 encoding='utf-8') as source:
 
             with source.file as f:
-                f.write(VERSION_C if language == 'c' else VERSION_CPP)
+                f.write(version_c if language == 'c' else version_cpp)
 
             err = ImplicitCompilerInfo.\
                 __get_compiler_err([compiler, source.name])
@@ -691,6 +694,8 @@ def __collect_clang_compile_opts(flag_iterator, details):
     if CLANG_OPTIONS.match(flag_iterator.item):
         details['analyzer_options'].append(flag_iterator.item)
         return True
+
+    return False
 
 
 def __collect_transform_xclang_opts(flag_iterator, details):
@@ -1048,6 +1053,11 @@ def parse_options(compilation_db_entry,
         details['action_type'] = BuildAction.COMPILE
 
     details['source'] = compilation_db_entry['file']
+    # Calculate absolute path to file if not already abs
+    if not Path(details['source']).is_absolute():
+        details['source'] = str(Path(
+            Path(compilation_db_entry['directory']).absolute(),
+            compilation_db_entry['file']).resolve())
 
     # In case the file attribute in the entry is empty.
     if details['source'] == '.':
@@ -1184,7 +1194,6 @@ def extend_compilation_database_entries(compilation_database):
 
 class CompileCommandEncoder(json.JSONEncoder):
     """JSON serializer for objects not serializable by default json code"""
-    # pylint: disable=method-hidden
     def default(self, o):
         if isinstance(o, BuildAction):
             return o.to_dict()
@@ -1264,7 +1273,8 @@ def parse_unique_log(compilation_database,
                               used to execute the analysis
     """
     try:
-        uniqued_build_actions = dict()
+        uniqued_build_actions = {}
+        uniqueing_re = None
 
         if compile_uniqueing == "alpha":
             build_action_uniqueing = CompileActionUniqueingType.SOURCE_ALPHA
@@ -1281,22 +1291,7 @@ def parse_unique_log(compilation_database,
         skipped_cmp_cmd_count = 0
 
         for entry in extend_compilation_database_entries(compilation_database):
-            # Normalization needs to be done here, because the skip regex
-            # won't match properly in the skiplist handler.
-            entry['file'] = os.path.normpath(
-                os.path.join(entry['directory'], entry['file']))
-            # Skip parsing the compilaton commands if it should be skipped
-            # at both analysis phases (pre analysis and analysis).
-            # Skipping of the compile commands is done differently if no
-            # CTU or statistics related feature was enabled.
-            if analysis_skip_handlers \
-                and analysis_skip_handlers.should_skip(entry['file']) \
-                and (not ctu_or_stats_enabled or pre_analysis_skip_handlers
-                     and pre_analysis_skip_handlers.should_skip(
-                         entry['file'])):
-                skipped_cmp_cmd_count += 1
-                continue
-
+            # Parse compilation db entry into an action object
             action = parse_options(entry,
                                    compiler_info_file,
                                    keep_gcc_include_fixed,
@@ -1304,9 +1299,24 @@ def parse_unique_log(compilation_database,
                                    clangsa.version.get,
                                    analyzer_clang_version)
 
+            # Skip parsing the compilaton commands if it should be skipped
+            # at both analysis phases (pre analysis and analysis).
+            # Skipping of the compile commands is done differently if no
+            # CTU or statistics related feature was enabled.
+            if analysis_skip_handlers \
+                and analysis_skip_handlers.should_skip(action.source) \
+                and (not ctu_or_stats_enabled or pre_analysis_skip_handlers
+                     and pre_analysis_skip_handlers.should_skip(
+                         action.source)):
+                skipped_cmp_cmd_count += 1
+                LOG.debug("skipping: %s", action.source)
+                continue
+
             if not action.lang:
+                skipped_cmp_cmd_count += 1
                 continue
             if action.action_type != BuildAction.COMPILE:
+                skipped_cmp_cmd_count += 1
                 continue
             if build_action_uniqueing == CompileActionUniqueingType.NONE:
                 if action not in uniqued_build_actions:

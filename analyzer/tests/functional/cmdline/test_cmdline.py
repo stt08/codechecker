@@ -19,11 +19,11 @@ import unittest
 from libtest import env
 
 
-def run_cmd(cmd, env=None):
+def run_cmd(cmd, environ=None):
     print(cmd)
     proc = subprocess.Popen(
         cmd,
-        env=env,
+        env=environ,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         encoding="utf-8",
@@ -38,6 +38,11 @@ class TestCmdline(unittest.TestCase):
     """
     Simple tests to check CodeChecker command line.
     """
+
+    def __init__(self, methodName):
+        self.test_workspace = None
+        self._codechecker_cmd = None
+        super().__init__(methodName)
 
     def setup_class(self):
         """Setup the environment for the tests."""
@@ -57,7 +62,7 @@ class TestCmdline(unittest.TestCase):
         print("Removing: " + TEST_WORKSPACE)
         shutil.rmtree(TEST_WORKSPACE)
 
-    def setup_method(self, method):
+    def setup_method(self, _):
         # TEST_WORKSPACE is automatically set by test package __init__.py .
         self.test_workspace = os.environ['TEST_WORKSPACE']
 
@@ -152,8 +157,8 @@ class TestCmdline(unittest.TestCase):
                         '--guideline', 'sei-cert']
         _, out, _ = run_cmd(checkers_cmd)
 
-        self.assertNotIn('readability', out)
-        self.assertIn('cert-str34-c', out)
+        self.assertIn('cert-dcl58-cpp', out)
+        self.assertNotIn('android', out)
 
         checkers_cmd = [env.codechecker_cmd(), 'checkers',
                         '--guideline', 'sei-cert:mem35-c']
@@ -169,10 +174,12 @@ class TestCmdline(unittest.TestCase):
         out = json.loads(out)
 
         for checker in out:
-            self.assertTrue(checker['name'].endswith('sizeof-expression') or
-                            checker['name'].endswith('SizeofPtr') or
-                            checker['name'].endswith('CastSize') or
-                            checker['name'].endswith('MallocSizeof'))
+            self.assertTrue(any(checker['name'].endswith(c)
+                            for c in ['sizeof-expression',
+                                      'Malloc',
+                                      'MallocSizeof',
+                                      'clang-diagnostic-format-overflow',
+                                      'overflow-non-kprintf']))
 
         checkers_cmd = [env.codechecker_cmd(), 'checkers', '--guideline']
         _, out, _ = run_cmd(checkers_cmd)
@@ -249,6 +256,41 @@ class TestCmdline(unittest.TestCase):
             desc = cfg['description']
             self.assertTrue(desc)
             self.assertFalse(desc[0].islower())
+
+    def test_parse_incorrect_file_path(self):
+        """
+        This test checks whether the parse command stops running if a
+        non-existent path is specified.
+        """
+
+        parse_cmd = [env.codechecker_cmd(), 'parse', '/asd/123/qwe']
+
+        self.assertIn('Input path /asd/123/qwe does not exist!',
+                      run_cmd(parse_cmd)[1])
+
+    def test_analyze_incorrect_checker_analyzer(self):
+        """
+        This test checks whether the analyze command stops running if a
+        non-existent path is specified.
+        """
+        test_file = os.path.join(self.test_workspace, 'main.cpp')
+
+        with open(test_file, 'w', encoding="utf-8", errors="ignore") as f:
+            f.write("int main() {}")
+
+        cmd_err = [env.codechecker_cmd(), 'check',
+                   '--analyzer-config', 'clang:asd=1',
+                   '--checker-config', 'clang:asd:asd=1',
+                   '--build', f'g++ {test_file}']
+
+        cmd_no_err = [env.codechecker_cmd(), 'check',
+                      '--analyzer-config', 'clang:asd=1',
+                      '--checker-config', 'clang:asd:asd=1',
+                      '--no-missing-checker-error',
+                      '--build', f'g++ {test_file}']
+
+        self.assertEqual(1, run_cmd(cmd_err)[0])
+        self.assertIn('Build finished successfully', run_cmd(cmd_no_err)[1])
 
     def test_checker_config_format(self):
         """

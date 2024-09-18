@@ -9,6 +9,7 @@
     item-key="checker"
     sort-by="severity"
     sort-desc
+    :necessary-total="true"
   />
 </template>
 

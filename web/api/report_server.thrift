@@ -42,6 +42,15 @@ enum Order {
 }
 
 /**
+ * Report status can show the current status of the report
+ * that depends on the review and thedetection status.
+ */
+enum ReportStatus {
+  OUTSTANDING, // The report is outstanding according to the review- and the detection status.
+  CLOSED       // The report is not a valid bug according to the review- and the detection status.
+}
+
+/**
  * Review status is a feature which allows a user to assign one of these
  * statuses to a particular Report.
  */
@@ -73,6 +82,7 @@ enum SortType {
   DETECTION_STATUS,
   BUG_PATH_LENGTH,
   TIMESTAMP,
+  TESTCASE
 }
 
 enum RunSortType {
@@ -380,6 +390,7 @@ struct ReportFilter {
   // [(key1, value1), (key1, value2), (key2, value3)] returns reports which
   // have "value1" OR "value2" for "key1" AND have "value3" for "key2".
   22: optional list<Pair> annotations,
+  23: optional list<ReportStatus>  reportStatus, // Specifying the status of the filtered reports.
 }
 
 struct RunReportCount {
@@ -395,6 +406,17 @@ struct CheckerCount {
   3: i64         count     // Number of reports.
 }
 typedef list<CheckerCount> CheckerCounts
+
+struct CheckerStatusVerificationDetail {
+  1: string       checkerName,  // Checker name.
+  2: string       analyzerName, // Analyzer name of the checker.
+  3: Severity     severity,     // Severity level of the checker.
+  4: list<i64>    enabled,      // Run ids in which the checker enabled.
+  5: list<i64>    disabled,     // Run ids in which the checker disabled.
+  6: i64          closed        // Number of closed reports.
+  7: i64          outstanding   // Number of outstanding reports.
+}
+typedef map<i64, CheckerStatusVerificationDetail> CheckerStatusVerificationDetails
 
 struct CommentData {
   1: i64     id,
@@ -602,7 +624,9 @@ service codeCheckerDBAccess {
   // Get report annotation values belonging to the given key.
   // The "key" parameter is optional. If not given then the list of keys returns.
   // PERMISSION: PRODUCT_VIEW
-  list<string> getReportAnnotations(1: optional string key),
+  list<string> getReportAnnotations(2: list<i64>    runIds,
+                                    3: ReportFilter reportFilter,
+                                    4: CompareData  cmpData),
 
   // Count the results separately for multiple runs.
   // If an empty run id list is provided the report
@@ -812,6 +836,16 @@ service codeCheckerDBAccess {
                                        5: i64          offset)
                                        throws (1: codechecker_api_shared.RequestFailed requestError),
 
+  // getReportStatusCounts returns ReportStatus-count pairs
+  // to show the number of outstanding and closed reports.
+  // If the run id list is empty the metrics will be
+  // counted for all of the runs.
+  // PERMISSION: PRODUCT_VIEW
+  map<ReportStatus, i64> getReportStatusCounts(1: list<i64>    runIds,
+                                             2: ReportFilter reportFilter,
+                                             3: CompareData  cmpData)
+                                             throws (1: codechecker_api_shared.RequestFailed requestError),
+
   // If the run id list is empty the metrics will be counted
   // for all of the runs and in compare mode all of the runs
   // will be used as a baseline excluding the runs in compare data.
@@ -851,6 +885,15 @@ service codeCheckerDBAccess {
                                  4: i64          limit,
                                  5: i64          offset)
                                  throws (1: codechecker_api_shared.RequestFailed requestError),
+
+  // It gives statistics for specific runs which checkers were
+  // enabled and how many reports are opened or closed.
+  // If the run id list is empty the statistics
+  // will be counted for all of the runs.
+  // PERMISSION: PRODUCT_VIEW
+  CheckerStatusVerificationDetails getCheckerStatusVerificationDetails(1: list<i64>    runIds,
+                                                                       2: ReportFilter reportFilter)
+                                                                       throws (1: codechecker_api_shared.RequestFailed requestError),
 
   // If the run id list is empty the metrics will be counted
   // for all of the runs and in compare mode all of the runs

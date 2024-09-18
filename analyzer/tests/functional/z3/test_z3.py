@@ -10,7 +10,7 @@
 """ Z3 feature test.  """
 
 
-from distutils import util
+from codechecker_common.util import strtobool
 import os
 import shutil
 import unittest
@@ -91,7 +91,7 @@ class TestSkeleton(unittest.TestCase):
         print("Removing: " + TEST_WORKSPACE)
         shutil.rmtree(TEST_WORKSPACE, ignore_errors=True)
 
-    def setup_method(self, method):
+    def setup_method(self, _):
 
         # TEST_WORKSPACE is automatically set by test package __init__.py .
         test_workspace = os.environ['TEST_WORKSPACE']
@@ -116,8 +116,9 @@ class TestSkeleton(unittest.TestCase):
 
         if not self.z3_capable:
             try:
-                self.z3_capable = bool(util.strtobool(
-                    os.environ['CC_TEST_FORCE_Z3_CAPABLE']))
+                self.z3_capable = strtobool(
+                    os.environ['CC_TEST_FORCE_Z3_CAPABLE']
+                )
             except (ValueError, KeyError):
                 pass
 

@@ -13,7 +13,9 @@ and browser requests.
 
 import atexit
 import datetime
+from functools import partial
 from hashlib import sha256
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 import os
 import posixpath
 from random import sample
@@ -23,12 +25,10 @@ import socket
 import ssl
 import sys
 import stat
+from typing import List, Optional, Tuple
 import urllib
 
-from http.server import HTTPServer, BaseHTTPRequestHandler, \
-    SimpleHTTPRequestHandler
 import multiprocess
-
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql.expression import func
 from thrift.protocol import TJSONProtocol
@@ -48,17 +48,15 @@ from codechecker_api.ProductManagement_v6 import \
 from codechecker_api.ServerInfo_v6 import \
     serverInfoService as ServerInfoAPI_v6
 
+from codechecker_common import util
 from codechecker_common.logger import get_logger
+from codechecker_common.compatibility.multiprocessing import \
+    Pool, cpu_count
 
+from codechecker_web.shared import database_status
 from codechecker_web.shared.version import get_version_str
 
-from . import instance_manager
-from . import permissions
-from . import routing
-from . import session_manager
-
-from .tmp import get_tmp_dir_hash
-
+from . import instance_manager, permissions, routing, session_manager
 from .api.authentication import ThriftAuthHandler as AuthHandler_v6
 from .api.config_handler import ThriftConfigHandler as ConfigHandler_v6
 from .api.product_server import ThriftProductHandler as ProductHandler_v6
@@ -70,6 +68,8 @@ from .database.config_db_model import Product as ORMProduct, \
     Configuration as ORMConfiguration
 from .database.database import DBSession
 from .database.run_db_model import IDENTIFIER as RUN_META, Run, RunLock
+from .tmp import get_tmp_dir_hash
+
 
 LOG = get_logger('server')
 
@@ -82,12 +82,10 @@ class RequestHandler(SimpleHTTPRequestHandler):
     auth_session = None
 
     def __init__(self, request, client_address, server):
-        BaseHTTPRequestHandler.__init__(self,
-                                        request,
-                                        client_address,
-                                        server)
+        self.path = None
+        super().__init__(request, client_address, server)
 
-    def log_message(self, msg_format, *args):
+    def log_message(self, *args):
         """ Silencing http server. """
         return
 
@@ -143,24 +141,12 @@ class RequestHandler(SimpleHTTPRequestHandler):
             # present an error.
             client_host, client_port, is_ipv6 = \
                 RequestHandler._get_client_host_port(self.client_address)
-            LOG.debug("%s:%s Invalid access, credentials not found - "
-                      "session refused",
-                      client_host if not is_ipv6 else '[' + client_host + ']',
-                      str(client_port))
+            LOG.debug(
+                "%s:%s Invalid access, credentials not found - "
+                "session refused",
+                client_host if not is_ipv6 else '[' + client_host + ']',
+                str(client_port))
             return None
-
-    def __has_access_permission(self, product):
-        """
-        Returns True if the currently authenticated user has access permission
-        on the given product.
-        """
-        with DBSession(self.server.config_session) as session:
-            perm_args = {'productID': product.id,
-                         'config_db_session': session}
-            return permissions.require_permission(
-                permissions.PRODUCT_ACCESS,
-                perm_args,
-                self.auth_session)
 
     def __handle_readiness(self):
         """ Handle readiness probe. """
@@ -196,9 +182,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
             if token:
                 self.send_header(
                     "Set-Cookie",
-                    "{0}={1}; Path=/".format(
-                        session_manager.SESSION_COOKIE_NAME,
-                        token))
+                    f"{session_manager.SESSION_COOKIE_NAME}={token}; Path=/")
 
             # Set the current user name in the header.
             user_name = self.auth_session.user
@@ -257,8 +241,7 @@ class RequestHandler(SimpleHTTPRequestHandler):
 
         # Check that path contains a product endpoint.
         if product_endpoint is not None and product_endpoint != '':
-            self.path = self.path.replace(
-                "{0}/".format(product_endpoint), "", 1)
+            self.path = self.path.replace(f"{product_endpoint}/", "", 1)
 
         if self.path == '/':
             self.path = "index.html"
@@ -281,8 +264,8 @@ class RequestHandler(SimpleHTTPRequestHandler):
         product = self.server.get_product(product_endpoint)
         if not product:
             raise ValueError(
-                "The product with the given endpoint '{0}' does "
-                "not exist!".format(product_endpoint))
+                f"The product with the given endpoint '{product_endpoint}' "
+                "does not exist!")
 
         if product.db_status == DBStatus.OK:
             # No reconnect needed.
@@ -300,21 +283,20 @@ class RequestHandler(SimpleHTTPRequestHandler):
             if product.db_status != DBStatus.OK:
                 # If the reconnection fails send an error to the user.
                 LOG.debug("Product reconnection failed.")
-                error_msg = "'{0}' database connection " \
-                    "failed!".format(product.endpoint)
+                error_msg = f"'{product.endpoint}' database connection failed!"
                 LOG.error(error_msg)
                 raise ValueError(error_msg)
         else:
             # Send an error to the user.
             db_stat = DBStatus._VALUES_TO_NAMES.get(product.db_status)
-            error_msg = "'{0}' database connection " \
-                "failed. DB status: {1}".format(product.endpoint,
-                                                str(db_stat))
+            error_msg = f"'{product.endpoint}' database connection " \
+                f"failed. DB status: {str(db_stat)}"
             LOG.error(error_msg)
             raise ValueError(error_msg)
 
         return product
 
+    # pylint: disable=invalid-name
     def do_POST(self):
         """
         Handles POST queries, which are usually Thrift messages.
@@ -372,9 +354,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         try:
             product_endpoint, api_ver, request_endpoint = \
                 routing.split_client_POST_request(self.path)
-            if product_endpoint is None and api_ver is None and\
+            if product_endpoint is None and api_ver is None and \
                     request_endpoint is None:
-                raise Exception("Invalid request endpoint path.")
+                raise ValueError("Invalid request endpoint path.")
 
             product = None
             if product_endpoint:
@@ -413,9 +395,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
                     elif request_endpoint == 'CodeCheckerService':
                         # This endpoint is a product's report_server.
                         if not product:
-                            error_msg = "Requested CodeCheckerService on a " \
-                                         "nonexistent product: '{0}'." \
-                                        .format(product_endpoint)
+                            error_msg = \
+                                "Requested CodeCheckerService on a " \
+                                f"nonexistent product: '{product_endpoint}'."
                             LOG.error(error_msg)
                             raise ValueError(error_msg)
 
@@ -436,14 +418,17 @@ class RequestHandler(SimpleHTTPRequestHandler):
                         processor = ReportAPI_v6.Processor(acc_handler)
                     else:
                         LOG.debug("This API endpoint does not exist.")
-                        error_msg = "No API endpoint named '{0}'." \
-                                    .format(self.path)
+                        error_msg = f"No API endpoint named '{self.path}'."
                         raise ValueError(error_msg)
+                else:
+                    raise ValueError(
+                        f"API version {major_version} not supported")
 
             else:
-                error_msg = "The API version you are using is not supported " \
-                            "by this server (server API version: {0})!".format(
-                                get_version_str())
+                error_msg = \
+                    "The API version you are using is not supported " \
+                    "by this server (server API version: " \
+                    f"{get_version_str()})!"
                 self.send_thrift_exception(error_msg, iprot, oprot, otrans)
                 return
 
@@ -473,12 +458,10 @@ class RequestHandler(SimpleHTTPRequestHandler):
                 iprot = input_protocol_factory.getProtocol(itrans)
 
             self.send_thrift_exception(str(ex), iprot, oprot, otrans)
-            return
 
     def list_directory(self, path):
         """ Disable directory listing. """
         self.send_error(405, "No permission to list directory")
-        return None
 
     def translate_path(self, path):
         """
@@ -511,14 +494,15 @@ class Product:
     # connect() call so the next could be made.
     CONNECT_RETRY_TIMEOUT = 300
 
-    def __init__(self, orm_object, context, check_env):
+    def __init__(self, id_: int, endpoint: str, display_name: str,
+                 connection_string: str, context, check_env):
         """
         Set up a new managed product object for the configuration given.
         """
-        self.__id = orm_object.id
-        self.__endpoint = orm_object.endpoint
-        self.__connection_string = orm_object.connection
-        self.__display_name = orm_object.display_name
+        self.__id = id_
+        self.__endpoint = endpoint
+        self.__display_name = display_name
+        self.__connection_string = connection_string
         self.__driver_name = None
         self.__context = context
         self.__check_env = check_env
@@ -585,11 +569,11 @@ class Product:
 
         Each time the connect is called the db_status is updated.
         """
-
         LOG.debug("Checking '%s' database.", self.endpoint)
 
         sql_server = database.SQLServer.from_connection_string(
             self.__connection_string,
+            self.__endpoint,
             RUN_META,
             self.__context.run_migration_root,
             interactive=False,
@@ -635,7 +619,7 @@ class Product:
                 .filter(RunLock.locked_at.isnot(None)) \
                 .all()
 
-            runs_in_progress = set([run_lock[0] for run_lock in run_locks])
+            runs_in_progress = set(run_lock[0] for run_lock in run_locks)
 
             num_of_runs = run_db_session.query(Run).count()
 
@@ -666,16 +650,83 @@ class Product:
         """
         Cleanup the run database which belongs to this product.
         """
-        LOG.info("Garbage collection for product '%s' started...",
-                 self.endpoint)
+        LOG.info("[%s] Garbage collection started...", self.endpoint)
 
-        db_cleanup.remove_expired_data(self.session_factory)
-        db_cleanup.remove_unused_data(self.session_factory)
-        db_cleanup.update_contextual_data(self.session_factory,
-                                          self.__context)
+        db_cleanup.remove_expired_data(self)
+        db_cleanup.remove_unused_data(self)
+        db_cleanup.update_contextual_data(self, self.__context)
 
-        LOG.info("Garbage collection finished.")
+        LOG.info("[%s] Garbage collection finished.", self.endpoint)
         return True
+
+
+def _do_db_cleanup(context, check_env,
+                   id_: int, endpoint: str, display_name: str,
+                   connection_str: str) -> Tuple[Optional[bool], str]:
+    # This functions is a concurrent job handler!
+    try:
+        prod = Product(id_, endpoint, display_name, connection_str,
+                       context, check_env)
+        prod.connect(init_db=False)
+        if prod.db_status != DBStatus.OK:
+            status_str = database_status.db_status_msg.get(prod.db_status)
+            return None, \
+                f"Cleanup not attempted, database status is \"{status_str}\""
+
+        prod.cleanup_run_db()
+        prod.teardown()
+
+        # Result is hard-wired to True, because the db_cleanup routines
+        # swallow and log the potential errors but do not return them.
+        return True, ""
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return False, str(e)
+
+
+def _do_db_cleanups(config_database, context, check_env) \
+        -> Tuple[bool, List[Tuple[str, str]]]:
+    """
+    Performs on-demand start-up database cleanup on all the products present
+    in the ``config_database``.
+
+    Returns whether database clean-up succeeded for all products, and the
+    list of products for which it failed, along with the failure reason.
+    """
+    def _get_products() -> List[Product]:
+        products = []
+        cfg_engine = config_database.create_engine()
+        cfg_session_factory = sessionmaker(bind=cfg_engine)
+        with DBSession(cfg_session_factory) as cfg_db:
+            for row in cfg_db.query(ORMProduct) \
+                    .order_by(ORMProduct.endpoint.asc()) \
+                    .all():
+                products.append((row.id, row.endpoint, row.display_name,
+                                 row.connection))
+        cfg_engine.dispose()
+        return products
+
+    products = _get_products()
+    if not products:
+        return True, []
+
+    thr_count = util.clamp(1, len(products), cpu_count())
+    overall_result, failures = True, []
+    with Pool(max_workers=thr_count) as executor:
+        LOG.info("Performing database cleanup using %d concurrent jobs...",
+                 thr_count)
+        for product, result in \
+                zip(products, executor.map(
+                    partial(_do_db_cleanup, context, check_env),
+                    *zip(*products))):
+            success, reason = result
+            if not success:
+                _, endpoint, _, _ = product
+                overall_result = False
+                failures.append((endpoint, reason))
+
+    return overall_result, failures
 
 
 class CCSimpleHttpServer(HTTPServer):
@@ -691,7 +742,6 @@ class CCSimpleHttpServer(HTTPServer):
                  RequestHandlerClass,
                  config_directory,
                  product_db_sql_server,
-                 skip_db_cleanup,
                  pckg_data,
                  context,
                  check_env,
@@ -728,11 +778,6 @@ class CCSimpleHttpServer(HTTPServer):
             })
         cfg_sess.commit()
         cfg_sess.close()
-
-        if not skip_db_cleanup:
-            for endpoint, product in self.__products.items():
-                if not product.cleanup_run_db():
-                    LOG.warning("Cleaning database for %s Failed.", endpoint)
 
         try:
             HTTPServer.__init__(self, server_address,
@@ -833,7 +878,10 @@ class CCSimpleHttpServer(HTTPServer):
 
         LOG.debug("Setting up product '%s'", orm_product.endpoint)
 
-        prod = Product(orm_product,
+        prod = Product(orm_product.id,
+                       orm_product.endpoint,
+                       orm_product.display_name,
+                       orm_product.connection,
                        self.context,
                        self.check_env)
 
@@ -916,8 +964,9 @@ class CCSimpleHttpServer(HTTPServer):
     def remove_product(self, endpoint):
         product = self.get_product(endpoint)
         if not product:
-            raise ValueError("The product with the given endpoint '{0}' does "
-                             "not exist!".format(endpoint))
+            raise ValueError(
+                f"The product with the given endpoint '{endpoint}' does "
+                "not exist!")
 
         LOG.info("Disconnecting product '%s'", endpoint)
         product.teardown()
@@ -929,9 +978,9 @@ class CCSimpleHttpServer(HTTPServer):
         Removes EVERY product connection from the server except those
         endpoints specified in :endpoints_to_keep.
         """
-        [self.remove_product(ep)
-            for ep in list(self.__products)
-            if ep not in endpoints_to_keep]
+        for ep in list(self.__products):
+            if ep not in endpoints_to_keep:
+                self.remove_product(ep)
 
 
 class CCSimpleHttpServerIPv6(CCSimpleHttpServer):
@@ -940,9 +989,6 @@ class CCSimpleHttpServerIPv6(CCSimpleHttpServer):
     """
 
     address_family = socket.AF_INET6
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
 
 def __make_root_file(root_file):
@@ -964,8 +1010,8 @@ def __make_root_file(root_file):
 
     # Highlight the message a bit more, as the server owner configuring the
     # server must know this root access initially.
-    credential_msg = "The superuser's username is '{0}' with the " \
-                     "password '{1}'".format(username, password)
+    credential_msg = f"The superuser's username is '{username}' with the " \
+                     f"password '{password}'"
     LOG.info("-" * len(credential_msg))
     LOG.info(credential_msg)
     LOG.info("-" * len(credential_msg))
@@ -983,7 +1029,7 @@ def __make_root_file(root_file):
 
 
 def start_server(config_directory, package_data, port, config_sql_server,
-                 listen_address, force_auth, skip_db_cleanup,
+                 listen_address, force_auth, skip_db_cleanup: bool,
                  context, check_env):
     """
     Start http server to handle web client and thrift requests.
@@ -1043,6 +1089,20 @@ def start_server(config_directory, package_data, port, config_sql_server,
         LOG.error("The server's configuration file is invalid!")
         sys.exit(1)
 
+    if not skip_db_cleanup:
+        all_success, fails = _do_db_cleanups(config_sql_server,
+                                             context,
+                                             check_env)
+        if not all_success:
+            LOG.error("Failed to perform automatic cleanup on %d products! "
+                      "Earlier logs might contain additional detailed "
+                      "reasoning.\n\t* %s", len(fails),
+                      "\n\t* ".join(
+                        (f"'{ep}' ({reason})" for (ep, reason) in fails)
+                      ))
+    else:
+        LOG.debug("Skipping db_cleanup, as requested.")
+
     server_clazz = CCSimpleHttpServer
     if ':' in server_addr[0]:
         # IPv6 address specified for listening.
@@ -1054,7 +1114,6 @@ def start_server(config_directory, package_data, port, config_sql_server,
                                RequestHandler,
                                config_directory,
                                config_sql_server,
-                               skip_db_cleanup,
                                package_data,
                                context,
                                check_env,
@@ -1067,7 +1126,7 @@ def start_server(config_directory, package_data, port, config_sql_server,
 
     processes = []
 
-    def signal_handler(signum, frame):
+    def signal_handler(signum, _):
         """
         Handle SIGTERM to stop the server running.
         """
@@ -1083,7 +1142,7 @@ def start_server(config_directory, package_data, port, config_sql_server,
 
         sys.exit(128 + signum)
 
-    def reload_signal_handler(*args, **kwargs):
+    def reload_signal_handler(*_args, **_kwargs):
         """
         Reloads server configuration file.
         """
@@ -1116,7 +1175,6 @@ def start_server(config_directory, package_data, port, config_sql_server,
     atexit.register(unregister_handler, os.getpid())
 
     for _ in range(manager.worker_processes - 1):
-        # pylint: disable=no-member multiprocess module members.
         p = multiprocess.Process(target=http_server.serve_forever)
         processes.append(p)
         p.start()

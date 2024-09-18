@@ -20,13 +20,13 @@ import time
 import zlib
 
 from copy import deepcopy
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, namedtuple
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sqlalchemy
 from sqlalchemy.sql.expression import or_, and_, not_, func, \
-    asc, desc, union_all, select, bindparam, literal_column
+    asc, desc, union_all, select, bindparam, literal_column, case, cast
 from sqlalchemy.orm import contains_eager
 
 import codechecker_api_shared
@@ -34,14 +34,16 @@ from codechecker_api.codeCheckerDBAccess_v6 import constants, ttypes
 from codechecker_api.codeCheckerDBAccess_v6.ttypes import \
     AnalysisInfoFilter, AnalysisInfoChecker as API_AnalysisInfoChecker, \
     BlameData, BlameInfo, BugPathPos, \
-    CheckerCount, Commit, CommitAuthor, CommentData, \
-    DiffType, \
+    CheckerCount, CheckerStatusVerificationDetail, Commit, CommitAuthor, \
+    CommentData, \
+    DetectionStatus, DiffType, \
     Encoding, ExportData, \
     Order, \
-    ReportData, ReportDetails, ReviewData, ReviewStatusRule, \
+    ReportData, ReportDetails, ReportStatus, ReviewData, ReviewStatusRule, \
     ReviewStatusRuleFilter, ReviewStatusRuleSortMode, \
     ReviewStatusRuleSortType, RunData, RunFilter, RunHistoryData, \
     RunReportCount, RunSortType, RunTagCount, \
+    ReviewStatus as API_ReviewStatus, \
     SourceComponentData, SourceFileData, SortMode, SortType
 
 from codechecker_common import util
@@ -68,9 +70,11 @@ from ..database.run_db_model import \
     SourceComponent
 
 from .thrift_enum_helper import detection_status_enum, \
-    detection_status_str, review_status_enum, review_status_str, \
-    report_extended_data_type_enum
+    detection_status_str, report_status_enum, \
+    review_status_enum, review_status_str, report_extended_data_type_enum
 
+# These names are inherited from Thrift stubs.
+# pylint: disable=invalid-name
 
 LOG = get_logger('server')
 
@@ -92,6 +96,8 @@ def comment_kind_from_thrift_type(kind):
     elif kind == ttypes.CommentKind.SYSTEM:
         return CommentKindValue.SYSTEM
 
+    assert False, f"Unknown ttypes.CommentKind: {kind}"
+
 
 def comment_kind_to_thrift_type(kind):
     """ Convert the given comment kind from Python enum to Thrift type. """
@@ -99,6 +105,8 @@ def comment_kind_to_thrift_type(kind):
         return ttypes.CommentKind.USER
     elif kind == CommentKindValue.SYSTEM:
         return ttypes.CommentKind.SYSTEM
+
+    assert False, f"Unknown CommentKindValue: {kind}"
 
 
 def verify_limit_range(limit):
@@ -133,16 +141,16 @@ def slugify(text):
     return norm_text
 
 
-def exc_to_thrift_reqfail(func):
+def exc_to_thrift_reqfail(function):
     """
     Convert internal exceptions to RequestFailed exception
     which can be sent back on the thrift connections.
     """
-    func_name = func.__name__
+    func_name = function.__name__
 
     def wrapper(*args, **kwargs):
         try:
-            res = func(*args, **kwargs)
+            res = function(*args, **kwargs)
             return res
 
         except sqlalchemy.exc.SQLAlchemyError as alchemy_ex:
@@ -299,6 +307,28 @@ def process_report_filter(
 
         AND.append(or_(*OR))
 
+    if report_filter.reportStatus:
+        dst = list(map(detection_status_str,
+                       (DetectionStatus.NEW,
+                        DetectionStatus.UNRESOLVED,
+                        DetectionStatus.REOPENED)))
+        rst = list(map(review_status_str,
+                       (API_ReviewStatus.UNREVIEWED,
+                        API_ReviewStatus.CONFIRMED)))
+
+        OR = []
+        filter_query = and_(
+            Report.review_status.in_(rst),
+            Report.detection_status.in_(dst)
+        )
+        if ReportStatus.OUTSTANDING in report_filter.reportStatus:
+            OR.append(filter_query)
+
+        if ReportStatus.CLOSED in report_filter.reportStatus:
+            OR.append(not_(filter_query))
+
+        AND.append(or_(*OR))
+
     if report_filter.detectionStatus:
         dst = list(map(detection_status_str,
                        report_filter.detectionStatus))
@@ -376,11 +406,15 @@ def process_report_filter(
             if keep_all_annotations:
                 OR.append(or_(
                     ReportAnnotations.key != key,
-                    ReportAnnotations.value.in_(values)))
+                    *[ReportAnnotations.value.ilike(conv(v))
+                      for v in values]))
             else:
                 OR.append(and_(
                     ReportAnnotations.key == key,
-                    ReportAnnotations.value.in_(values)))
+                    or_(*[ReportAnnotations.value.ilike(conv(v))
+                          for v in values])) if values else and_(
+                              ReportAnnotations.key == key))
+
         AND.append(or_(*OR))
 
     filter_expr = and_(*AND)
@@ -489,10 +523,13 @@ def get_source_component_file_query(
     if skip and include:
         include_q, skip_q = get_include_skip_queries(include, skip)
         return File.id.in_(include_q.except_(skip_q))
-    elif include:
+
+    if include:
         return or_(*[File.filepath.like(conv(fp)) for fp in include])
     elif skip:
         return and_(*[not_(File.filepath.like(conv(fp))) for fp in skip])
+
+    return None
 
 
 def get_reports_by_bugpath_filter(session, file_filter_q) -> Set[int]:
@@ -579,6 +616,8 @@ def get_other_source_component_file_query(session):
             return and_(*[File.filepath.notlike(conv(fp)) for fp in include])
         elif skip:
             return or_(*[File.filepath.like(conv(fp)) for fp in skip])
+
+        return None
 
     queries = [get_query(n) for (n, ) in component_names]
     return and_(*queries)
@@ -707,25 +746,19 @@ def process_cmp_data_filter(session, run_ids, report_filter, cmp_data):
     query_new_runs = get_diff_run_id_query(session, cmp_data.runIds,
                                            cmp_data.runTag)
 
-    AND = []
     if cmp_data.diffType == DiffType.NEW:
         return and_(Report.bug_id.in_(query_new.except_(query_base)),
                     Report.run_id.in_(query_new_runs)), [Run]
-
     elif cmp_data.diffType == DiffType.RESOLVED:
         return and_(Report.bug_id.in_(query_base.except_(query_new)),
                     Report.run_id.in_(query_base_runs)), [Run]
-
     elif cmp_data.diffType == DiffType.UNRESOLVED:
         return and_(Report.bug_id.in_(query_base.intersect(query_new)),
                     Report.run_id.in_(query_new_runs)), [Run]
-
     else:
         raise codechecker_api_shared.ttypes.RequestFailed(
             codechecker_api_shared.ttypes.ErrorCode.DATABASE,
             'Unsupported diff type: ' + str(cmp_data.diffType))
-
-    return and_(*AND), []
 
 
 def process_run_history_filter(query, run_ids, run_history_filter):
@@ -859,7 +892,6 @@ def get_report_details(session, report_ids):
         .order_by(Comment.created_at.desc())
 
     for data, report_id in comment_query:
-        report_id = report_id
         comment_data = comment_data_db_to_api(data)
         comment_data_list[report_id].append(comment_data)
 
@@ -999,7 +1031,8 @@ def get_sort_map(sort_types, is_unique=False):
         SortType.SEVERITY: [(Checker.severity, 'severity')],
         SortType.REVIEW_STATUS: [(Report.review_status, 'rw_status')],
         SortType.DETECTION_STATUS: [(Report.detection_status, 'dt_status')],
-        SortType.TIMESTAMP: [('annotation_timestamp', 'annotation_timestamp')]}
+        SortType.TIMESTAMP: [('annotation_timestamp', 'annotation_timestamp')],
+        SortType.TESTCASE: [('annotation_testcase', 'annotation_testcase')]}
 
     if is_unique:
         sort_type_map[SortType.FILENAME] = [(File.filename, 'filename')]
@@ -1067,8 +1100,7 @@ def check_remove_runs_lock(session, run_ids):
         raise codechecker_api_shared.ttypes.RequestFailed(
             codechecker_api_shared.ttypes.ErrorCode.DATABASE,
             "Can not remove results because the following runs "
-            "are locked: {0}".format(
-                ', '.join([r[0] for r in run_locks])))
+            f"are locked: {', '.join([r[0] for r in run_locks])}")
 
 
 def sort_run_data_query(query, sort_mode):
@@ -1156,7 +1188,7 @@ def get_commit_url(
 ) -> Optional[str]:
     """ Get commit url for the given remote url. """
     if not remote_url:
-        return
+        return None
 
     for git_commit_url in git_commit_urls:
         m = git_commit_url["regex"].match(remote_url)
@@ -1167,6 +1199,8 @@ def get_commit_url(
                     url = url.replace(f"${key}", value)
 
             return url
+
+    return None
 
 
 def get_cleanup_plan(session, cleanup_plan_id: int) -> CleanupPlan:
@@ -1282,6 +1316,62 @@ def get_rs_rule_query(
     return q
 
 
+def get_run_id_expression(session, report_filter):
+    """
+    Get run id or concatenated run id list by the unique mode and the DB type
+    """
+    if report_filter.isUnique:
+        if session.bind.dialect.name == "postgresql":
+            return func.string_agg(
+                cast(Run.id, sqlalchemy.String).distinct(),
+                ','
+            ).label("run_id")
+        return func.group_concat(Run.id.distinct()).label("run_id")
+    return Run.id.label("run_id")
+
+
+def get_is_enabled_case(subquery):
+    """
+    Creating a case statement to decide the report
+    is enabled or not based on the detection status
+    """
+    detection_status_filters = subquery.c.detection_status.in_(list(
+        map(detection_status_str,
+            (DetectionStatus.OFF, DetectionStatus.UNAVAILABLE))
+    ))
+
+    return case(
+        [(detection_status_filters, False)],
+        else_=True
+    )
+
+
+def get_is_opened_case(subquery):
+    """
+    Creating a case statement to decide the report is opened or not
+    based on the detection status and the review status
+    """
+    detection_statuses = (
+        DetectionStatus.NEW,
+        DetectionStatus.UNRESOLVED,
+        DetectionStatus.REOPENED
+    )
+    review_statuses = (
+        API_ReviewStatus.UNREVIEWED,
+        API_ReviewStatus.CONFIRMED
+    )
+    detection_and_review_status_filters = [
+        subquery.c.detection_status.in_(list(map(
+            detection_status_str, detection_statuses))),
+        subquery.c.review_status.in_(list(map(
+            review_status_str, review_statuses)))
+    ]
+    return case(
+        [(and_(*detection_and_review_status_filters), True)],
+        else_=False
+    )
+
+
 class ThriftRequestHandler:
     """
     Connect to database and handle thrift client requests.
@@ -1357,9 +1447,9 @@ class ThriftRequestHandler:
             args = dict(self.__permission_args)
             args['config_db_session'] = session
 
-            if not any([permissions.require_permission(
+            if not any(permissions.require_permission(
                     perm, args, self._auth_session)
-                    for perm in required]):
+                    for perm in required):
                 raise codechecker_api_shared.ttypes.RequestFailed(
                     codechecker_api_shared.ttypes.ErrorCode.UNAUTHORIZED,
                     "You are not authorized to execute this action.")
@@ -1459,13 +1549,14 @@ class ThriftRequestHandler:
                 status_sum[run_id][detection_status_enum(status)] = count
 
             # Get analyzer statistics.
-            analyzer_statistics = defaultdict(lambda: defaultdict())
+            analyzer_statistics = defaultdict(defaultdict)
 
             stat_q = get_analysis_statistics_query(session, run_filter.ids)
-            for stat, run_id in stat_q:
-                analyzer_statistics[run_id][stat.analyzer_type] = \
-                    ttypes.AnalyzerStatistics(failed=stat.failed,
-                                              successful=stat.successful)
+            for analyzer_stat, run_id in stat_q:
+                analyzer_statistics[run_id][analyzer_stat.analyzer_type] = \
+                    ttypes.AnalyzerStatistics(
+                        failed=analyzer_stat.failed,
+                        successful=analyzer_stat.successful)
 
             results = []
 
@@ -1610,11 +1701,11 @@ class ThriftRequestHandler:
             results = []
             for history in res:
                 analyzer_statistics = {}
-                for stat in history.analyzer_statistics:
-                    analyzer_statistics[stat.analyzer_type] = \
+                for analyzer_stat in history.analyzer_statistics:
+                    analyzer_statistics[analyzer_stat.analyzer_type] = \
                         ttypes.AnalyzerStatistics(
-                            failed=stat.failed,
-                            successful=stat.successful)
+                            failed=analyzer_stat.failed,
+                            successful=analyzer_stat.successful)
 
                 results.append(RunHistoryData(
                     id=history.id,
@@ -1748,8 +1839,8 @@ class ThriftRequestHandler:
                     # than 8435 sqlite threw a `Segmentation fault` error.
                     # For this reason we create queries with chunks.
                     new_hashes = []
-                    for chunk in util.chunks(iter(report_hashes),
-                                             SQLITE_MAX_COMPOUND_SELECT):
+                    for chunk in util.chunks(
+                            iter(report_hashes), SQLITE_MAX_COMPOUND_SELECT):
                         new_hashes_query = union_all(*[
                             select([bindparam('bug_id' + str(i), h)
                                     .label('bug_id')])
@@ -1774,7 +1865,6 @@ class ThriftRequestHandler:
                         results, run_ids, tag_ids)
 
                 return [res[0] for res in results]
-
             elif diff_type == DiffType.UNRESOLVED:
                 results = session.query(Report.bug_id) \
                     .filter(Report.bug_id.in_(report_hashes))
@@ -1793,7 +1883,6 @@ class ThriftRequestHandler:
                         results, run_ids, tag_ids)
 
                 return [res[0] for res in results]
-
             else:
                 return []
 
@@ -1874,117 +1963,114 @@ class ThriftRequestHandler:
                     ReportAnnotations.value)])).label(f"annotation_{col}")
 
             if report_filter.isUnique:
+                # A report annotation filter cannot be set in WHERE clause if
+                # we use annotation parameters in aggregate functions to
+                # create a pivot table. Instead of filtering report
+                # annotations in WHERE clause, we should use HAVING clause
+                # only for filtering aggregate functions.
+                # TODO: Fixing report annotation filter in every report server
+                # endpoint function.
+                annotations_backup = report_filter.annotations
+                report_filter.annotations = None
                 filter_expression, join_tables = process_report_filter(
-                    session, run_ids, report_filter, cmp_data,
-                    keep_all_annotations=False)
+                    session, run_ids, report_filter, cmp_data)
 
                 sort_types, sort_type_map, order_type_map = \
                     get_sort_map(sort_types, True)
 
-                selects = [func.max(Report.id).label('id')]
-                for sort in sort_types:
-                    sorttypes = sort_type_map.get(sort.type)
-                    for sorttype in sorttypes:
-                        if sorttype[0] != 'bug_path_length':
-                            selects.append(func.max(sorttype[0])
-                                           .label(sorttype[1]))
+                # TODO: Create a helper function for common section of unique
+                # and non unique modes.
+                sub_query = session.query(Report,
+                                          File.filename,
+                                          Checker.analyzer_name,
+                                          Checker.checker_name,
+                                          Checker.severity,
+                                          func.row_number().over(
+                                            partition_by=Report.bug_id,
+                                            order_by=desc(Report.id)
+                                          ).label("row_num"),
+                                          *annotation_cols.values()) \
+                                   .join(Checker,
+                                         Report.checker_id == Checker.id) \
+                                   .options(contains_eager(Report.checker)) \
+                                   .outerjoin(File,
+                                              Report.file_id == File.id) \
+                                   .outerjoin(ReportAnnotations,
+                                              Report.id ==
+                                              ReportAnnotations.report_id)
 
-                unique_reports = session.query(*selects)
-                unique_reports = apply_report_filter(unique_reports,
-                                                     filter_expression,
-                                                     join_tables)
-                if report_filter.annotations is not None:
-                    unique_reports = unique_reports.outerjoin(
-                        ReportAnnotations,
-                        Report.id == ReportAnnotations.report_id)
-                unique_reports = unique_reports \
-                    .group_by(Report.bug_id) \
-                    .subquery()
+                sub_query = apply_report_filter(sub_query,
+                                                filter_expression,
+                                                join_tables,
+                                                [File, Checker])
 
-                # Sort the results.
-                sorted_reports = session.query(unique_reports.c.id)
-                sorted_reports = sort_results_query(sorted_reports,
-                                                    sort_types,
-                                                    sort_type_map,
-                                                    order_type_map,
-                                                    True)
-                sorted_reports = sorted_reports \
-                    .limit(limit).offset(offset).subquery()
+                sub_query = sub_query.group_by(Report.id, File.id, Checker.id)
 
-                q = session.query(Report,
-                                  File.filename,
-                                  *annotation_cols.values()) \
-                    .join(Checker,
-                          Report.checker_id == Checker.id) \
-                    .options(contains_eager(Report.checker)) \
-                    .outerjoin(
-                        File,
-                        Report.file_id == File.id) \
-                    .outerjoin(
-                        ReportAnnotations,
-                        Report.id == ReportAnnotations.report_id) \
-                    .outerjoin(sorted_reports,
-                               sorted_reports.c.id == Report.id) \
-                    .filter(sorted_reports.c.id.isnot(None))
-
-                if report_filter.annotations is not None:
+                if annotations_backup:
                     annotations = defaultdict(list)
-                    for annotation in report_filter.annotations:
+                    for annotation in annotations_backup:
                         annotations[annotation.first].append(annotation.second)
 
                     OR = []
                     for key, values in annotations.items():
-                        OR.append(annotation_cols[key].in_(values))
-                    q = q.having(or_(*OR))
+                        OR.extend([annotation_cols[key].ilike(conv(v))
+                                   for v in values])
+                    sub_query = sub_query.having(or_(*OR))
 
-                # We have to sort the results again because an ORDER BY in a
-                # subtable is broken by the JOIN.
-                q = sort_results_query(q,
-                                       sort_types,
-                                       sort_type_map,
-                                       order_type_map)
-                q = q.group_by(Report.id, File.id, Checker.id)
+                sub_query = sort_results_query(sub_query,
+                                               sort_types,
+                                               sort_type_map,
+                                               order_type_map)
 
-                query_result = q.all()
+                sub_query = sub_query.subquery().alias()
+
+                q = session.query(sub_query) \
+                           .filter(sub_query.c.row_num == 1) \
+                           .limit(limit).offset(offset)
+
+                QueryResult = namedtuple('QueryResult', sub_query.c.keys())
+                query_result = [QueryResult(*row) for row in q.all()]
 
                 # Get report details if it is required.
                 report_details = {}
                 if get_details:
-                    report_ids = [r[0].id for r in query_result]
+                    report_ids = [r.id for r in query_result]
                     report_details = get_report_details(session, report_ids)
 
                 for row in query_result:
-                    report, filename = row[0], row[1]
                     annotations = {
-                        k: v for k, v in zip(annotation_keys, row[2:])
-                        if v is not None}
+                        k: v for k, v in zip(
+                            annotation_keys,
+                            [getattr(row, 'annotation_testcase', None),
+                             getattr(row, 'annotation_timestamp', None)]
+                            ) if v is not None}
 
                     review_data = create_review_data(
-                        report.review_status,
-                        report.review_status_message,
-                        report.review_status_author,
-                        report.review_status_date,
-                        report.review_status_is_in_source)
+                        row.review_status,
+                        row.review_status_message,
+                        row.review_status_author,
+                        row.review_status_date,
+                        row.review_status_is_in_source)
 
                     results.append(
-                        ReportData(runId=report.run_id,
-                                   bugHash=report.bug_id,
-                                   checkedFile=filename,
-                                   checkerMsg=report.checker_message,
-                                   reportId=report.id,
-                                   fileId=report.file_id,
-                                   line=report.line,
-                                   column=report.column,
-                                   analyzerName=report.checker.analyzer_name,
-                                   checkerId=report.checker.checker_name,
-                                   severity=report.checker.severity,
+                        ReportData(runId=row.run_id,
+                                   bugHash=row.bug_id,
+                                   checkedFile=row.filename,
+                                   checkerMsg=row.checker_message,
+                                   reportId=row.id,
+                                   fileId=row.file_id,
+                                   line=row.line,
+                                   column=row.column,
+                                   analyzerName=row.analyzer_name,
+                                   checkerId=row.checker_name,
+                                   severity=row.severity,
                                    reviewData=review_data,
                                    detectionStatus=detection_status_enum(
-                                       report.detection_status),
-                                   detectedAt=str(report.detected_at),
-                                   fixedAt=str(report.fixed_at),
-                                   bugPathLength=report.path_length,
-                                   details=report_details.get(report.id),
+                                    row.detection_status),
+                                   detectedAt=str(row.detected_at),
+                                   fixedAt=str(row.fixed_at),
+                                   bugPathLength=row.path_length,
+                                   details=report_details.get(row.id),
                                    annotations=annotations))
             else:  # not is_unique
                 filter_expression, join_tables = process_report_filter(
@@ -2027,6 +2113,13 @@ class ThriftRequestHandler:
                                        sort_type_map,
                                        order_type_map)
 
+                # Most queries are using paging of reports due their great
+                # number. This is implemented by LIMIT and OFFSET in the SQL
+                # queries. However, if there is no ordering in the query, then
+                # the reports in different pages may overlap. This ordering
+                # prevents it.
+                q = q.order_by(Report.id)
+
                 if report_filter.annotations is not None:
                     annotations = defaultdict(list)
                     for annotation in report_filter.annotations:
@@ -2034,7 +2127,8 @@ class ThriftRequestHandler:
 
                     OR = []
                     for key, values in annotations.items():
-                        OR.append(annotation_cols[key].in_(values))
+                        OR.extend([annotation_cols[key].ilike(conv(v))
+                                   for v in values])
                     q = q.having(or_(*OR))
 
                 q = q.limit(limit).offset(offset)
@@ -2086,20 +2180,44 @@ class ThriftRequestHandler:
 
     @exc_to_thrift_reqfail
     @timeit
-    def getReportAnnotations(self, key):
+    def getReportAnnotations(self, run_ids, report_filter, cmp_data):
         self.__require_view()
 
         with DBSession(self._Session) as session:
-            if key:
-                result = session \
-                    .query(ReportAnnotations.value) \
+            filter_expression, join_tables = process_report_filter(
+                session, run_ids, report_filter, cmp_data)
+
+            extended_table = session.query(Report.id)
+
+            extended_table = apply_report_filter(
+                extended_table, filter_expression, join_tables)
+
+            if report_filter.annotations is not None:
+                extended_table = extended_table.outerjoin(
+                    ReportAnnotations,
+                    ReportAnnotations.report_id == Report.id)
+                extended_table = extended_table.group_by(Report.id)
+                extended_table = extended_table.add_columns(
+                    ReportAnnotations.key.label('annotations_key'),
+                    ReportAnnotations.value.label('annotations_value')
+                ).group_by(ReportAnnotations.key, ReportAnnotations.value)
+
+                extended_table = extended_table.subquery()
+
+                result = session.query(extended_table.c.annotations_value) \
                     .distinct() \
-                    .filter(ReportAnnotations.key == key) \
+                    .filter(
+                        *(extended_table.c.annotations_key == annotation.first
+                          for annotation in report_filter.annotations)) \
                     .all()
             else:
-                result = session \
-                    .query(ReportAnnotations.key) \
+                extended_table = extended_table.subquery()
+
+                result = session.query(ReportAnnotations.value) \
                     .distinct() \
+                    .join(
+                        extended_table,
+                        ReportAnnotations.report_id == extended_table.c.id) \
                     .all()
 
         return list(map(lambda x: x[0], result))
@@ -2238,12 +2356,11 @@ class ThriftRequestHandler:
         new_review_status = review_status.status.capitalize()
         if message:
             system_comment_msg = \
-                'rev_st_changed_msg {0} {1} {2}'.format(
-                    old_review_status, new_review_status,
-                    shlex.quote(message))
+                f'rev_st_changed_msg {old_review_status} ' \
+                f'{new_review_status} {shlex.quote(message)}'
         else:
-            system_comment_msg = 'rev_st_changed {0} {1}'.format(
-                old_review_status, new_review_status)
+            system_comment_msg = \
+                f'rev_st_changed {old_review_status} {new_review_status}'
 
         system_comment = self.__add_comment(review_status.bug_hash,
                                             system_comment_msg,
@@ -2492,10 +2609,9 @@ class ThriftRequestHandler:
 
                 return result
             else:
-                msg = 'Report id ' + str(report_id) + \
-                      ' was not found in the database.'
                 raise codechecker_api_shared.ttypes.RequestFailed(
-                    codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
+                    codechecker_api_shared.ttypes.ErrorCode.DATABASE,
+                    f'Report id {report_id} was not found in the database.')
 
     @exc_to_thrift_reqfail
     @timeit
@@ -2535,8 +2651,7 @@ class ThriftRequestHandler:
 
                 return True
             else:
-                msg = 'Report id ' + str(report_id) + \
-                      ' was not found in the database.'
+                msg = f'Report id {report_id} was not found in the database.'
                 LOG.error(msg)
                 raise codechecker_api_shared.ttypes.RequestFailed(
                     codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
@@ -2562,7 +2677,7 @@ class ThriftRequestHandler:
 
             comment = session.query(Comment).get(comment_id)
             if comment:
-                if comment.author != 'Anonymous' and comment.author != user:
+                if comment.author not in ('Anonymous', user):
                     raise codechecker_api_shared.ttypes.RequestFailed(
                         codechecker_api_shared.ttypes.ErrorCode.UNAUTHORIZED,
                         'Unathorized comment modification!')
@@ -2570,9 +2685,9 @@ class ThriftRequestHandler:
                 # Create system comment if the message is changed.
                 message = comment.message.decode('utf-8')
                 if message != content:
-                    system_comment_msg = 'comment_changed {0} {1}'.format(
-                        shlex.quote(message),
-                        shlex.quote(content))
+                    system_comment_msg = \
+                        f'comment_changed {shlex.quote(message)} ' \
+                        f'{shlex.quote(content)}'
 
                     system_comment = \
                         self.__add_comment(comment.bug_hash,
@@ -2586,8 +2701,7 @@ class ThriftRequestHandler:
                 session.commit()
                 return True
             else:
-                msg = 'Comment id ' + str(comment_id) + \
-                      ' was not found in the database.'
+                msg = f'Comment id {comment_id} was not found in the database.'
                 LOG.error(msg)
                 raise codechecker_api_shared.ttypes.RequestFailed(
                     codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
@@ -2608,7 +2722,7 @@ class ThriftRequestHandler:
 
             comment = session.query(Comment).get(comment_id)
             if comment:
-                if comment.author != 'Anonymous' and comment.author != user:
+                if comment.author not in ('Anonymous', user):
                     raise codechecker_api_shared.ttypes.RequestFailed(
                         codechecker_api_shared.ttypes.ErrorCode.UNAUTHORIZED,
                         'Unathorized comment modification!')
@@ -2621,14 +2735,13 @@ class ThriftRequestHandler:
 
                 return True
             else:
-                msg = 'Comment id ' + str(comment_id) + \
-                      ' was not found in the database.'
                 raise codechecker_api_shared.ttypes.RequestFailed(
-                    codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
+                    codechecker_api_shared.ttypes.ErrorCode.DATABASE,
+                    f'Comment id {comment_id} was not found in the database.')
 
     @exc_to_thrift_reqfail
     @timeit
-    def getCheckerDoc(self, checkerId):
+    def getCheckerDoc(self, _):
         """
         Parameters:
          - checkerId
@@ -2745,6 +2858,7 @@ class ThriftRequestHandler:
                     commits=commits,
                     blame=blame_data)
             except Exception:
+                # pylint: disable=raise-missing-from
                 raise codechecker_api_shared.ttypes.RequestFailed(
                     codechecker_api_shared.ttypes.ErrorCode.DATABASE,
                     "Failed to get blame information for file id: " + fileId)
@@ -2770,8 +2884,8 @@ class ThriftRequestHandler:
                         .filter(File.id.in_(
                                 [line.fileId if line.fileId is not None
                                     else LOG.warning(
-                                        f"File content "
-                                        "requested without fileId {l}")
+                                        "File content requested "
+                                        f"without fileId {line.fileId}")
                                     for line in chunk])) \
                         .all()
                 for content in contents:
@@ -2860,6 +2974,127 @@ class ThriftRequestHandler:
                                              count=count)
                 results.append(checker_count)
         return results
+
+    @exc_to_thrift_reqfail
+    @timeit
+    def getCheckerStatusVerificationDetails(self, run_ids, report_filter):
+        self.__require_view()
+
+        with DBSession(self._Session) as session:
+            max_run_histories = session.query(
+                RunHistory.run_id,
+                func.max(RunHistory.id).label('max_run_history_id'),
+            ) \
+                .filter(RunHistory.run_id.in_(run_ids) if run_ids else True) \
+                .group_by(RunHistory.run_id)
+
+            run_id_expression = get_run_id_expression(session, report_filter)
+
+            subquery = (
+                session.query(
+                    run_id_expression,
+                    Checker.id.label("checker_id"),
+                    Checker.checker_name,
+                    Checker.analyzer_name,
+                    Checker.severity,
+                    Report.bug_id,
+                    Report.detection_status,
+                    Report.review_status,
+                )
+                .join(RunHistory)
+                .join(AnalysisInfo, RunHistory.analysis_info)
+                .join(DB_AnalysisInfoChecker, (
+                    (AnalysisInfo.id ==
+                     DB_AnalysisInfoChecker.analysis_info_id)
+                    & (DB_AnalysisInfoChecker.enabled.is_(True))))
+                .join(Checker,
+                      DB_AnalysisInfoChecker.checker_id == Checker.id)
+                .outerjoin(Report, ((Checker.id == Report.checker_id)
+                                    & (Run.id == Report.run_id)))
+                .filter(RunHistory.id == max_run_histories.subquery()
+                        .c.max_run_history_id)
+            )
+
+            if report_filter.isUnique:
+                subquery = subquery.group_by(
+                    Checker.id,
+                    Checker.checker_name,
+                    Checker.analyzer_name,
+                    Checker.severity,
+                    Report.bug_id,
+                    Report.detection_status,
+                    Report.review_status
+                )
+
+            subquery = subquery.subquery()
+
+            is_enabled_case = get_is_enabled_case(subquery)
+            is_opened_case = get_is_opened_case(subquery)
+
+            query = (
+                session.query(
+                    subquery.c.checker_id,
+                    subquery.c.checker_name,
+                    subquery.c.analyzer_name,
+                    subquery.c.severity,
+                    subquery.c.run_id,
+                    is_enabled_case.label("isEnabled"),
+                    is_opened_case.label("isOpened"),
+                    func.count(subquery.c.bug_id)
+                )
+                .group_by(
+                    subquery.c.checker_id,
+                    subquery.c.checker_name,
+                    subquery.c.analyzer_name,
+                    subquery.c.severity,
+                    subquery.c.run_id,
+                    is_enabled_case,
+                    is_opened_case
+                )
+            )
+
+            checker_stats = {}
+            all_run_id = [runId for runId, _ in max_run_histories.all()]
+            for checker_id, \
+                checker_name, \
+                analyzer_name, \
+                severity, \
+                run_id_list, \
+                is_enabled, \
+                is_opened, \
+                cnt \
+                    in query.all():
+
+                checker_stat = checker_stats.get(
+                    checker_id,
+                    CheckerStatusVerificationDetail(
+                        checkerName=checker_name,
+                        analyzerName=analyzer_name,
+                        enabled=[],
+                        disabled=all_run_id.copy(),
+                        severity=severity,
+                        closed=0,
+                        outstanding=0
+                    ))
+
+                if is_enabled:
+                    for r in (run_id_list.split(",")
+                              if isinstance(run_id_list, str)
+                              else [run_id_list]):
+                        run_id = int(r)
+                        if run_id not in checker_stat.enabled:
+                            checker_stat.enabled.append(run_id)
+                        if run_id in checker_stat.disabled:
+                            checker_stat.disabled.remove(run_id)
+
+                if is_enabled and is_opened:
+                    checker_stat.outstanding += cnt
+                else:
+                    checker_stat.closed += cnt
+
+                checker_stats[checker_id] = checker_stat
+
+            return checker_stats
 
     @exc_to_thrift_reqfail
     @timeit
@@ -3036,6 +3271,60 @@ class ThriftRequestHandler:
 
             results = dict(checker_messages.all())
         return results
+
+    @exc_to_thrift_reqfail
+    @timeit
+    def getReportStatusCounts(self, run_ids, report_filter, cmp_data):
+        """
+          If the run id list is empty the metrics will be counted
+          for all of the runs and in compare mode all of the runs
+          will be used as a baseline excluding the runs in compare data.
+        """
+        self.__require_view()
+        with DBSession(self._Session) as session:
+            filter_expression, join_tables = process_report_filter(
+                session, run_ids, report_filter, cmp_data)
+
+            extended_table = session.query(
+                Report.review_status,
+                Report.detection_status,
+                Report.bug_id
+            )
+
+            if report_filter.annotations is not None:
+                extended_table = extended_table.outerjoin(
+                    ReportAnnotations,
+                    ReportAnnotations.report_id == Report.id
+                )
+                extended_table = extended_table.group_by(Report.id)
+
+            extended_table = apply_report_filter(
+                extended_table, filter_expression, join_tables)
+
+            extended_table = extended_table.subquery()
+
+            is_outstanding_case = get_is_opened_case(extended_table)
+            case_label = "isOutstanding"
+
+            if report_filter.isUnique:
+                q = session.query(
+                    is_outstanding_case.label(case_label),
+                    func.count(extended_table.c.bug_id.distinct())) \
+                    .group_by(is_outstanding_case)
+            else:
+                q = session.query(
+                    is_outstanding_case.label(case_label),
+                    func.count(extended_table.c.bug_id)) \
+                    .group_by(is_outstanding_case)
+
+            results = {
+                report_status_enum(
+                    "outstanding" if isOutstanding
+                    else "closed"
+                ): count for isOutstanding, count in q
+            }
+
+            return results
 
     @exc_to_thrift_reqfail
     @timeit
@@ -3400,8 +3689,8 @@ class ThriftRequestHandler:
         # access timestamp to file entries to delay their removal (and avoid
         # removing frequently accessed files). The same comment applies to
         # removeRun() function.
-        db_cleanup.remove_unused_comments(self._Session)
-        db_cleanup.remove_unused_analysis_info(self._Session)
+        db_cleanup.remove_unused_comments(self._product)
+        db_cleanup.remove_unused_analysis_info(self._product)
 
         return True
 
@@ -3424,10 +3713,27 @@ class ThriftRequestHandler:
             # cascades and such. Deleting runs in separate transactions don't
             # exceed a potential statement timeout threshold in a DBMS.
             runs = []
+            deleted_run_cnt = 0
+
             for run in q.all():
-                runs.append(run.name)
-                session.delete(run)
-                session.commit()
+                try:
+                    runs.append(run.name)
+                    session.delete(run)
+                    session.commit()
+                    deleted_run_cnt += 1
+                except Exception as e:
+                    # TODO: Display alert on the GUI if there's an exception
+                    # TODO: Catch SQLAlchemyError instead of generic
+                    #  exception once it is confirmed that the exception is
+                    #  due to a large run deletion timeout based on server
+                    #  log warnings
+                    # This exception is handled silently because it is
+                    # expected to never occur, but there have been some rare
+                    # cases where it occurred due to underlying reasons.
+                    # Handling it silently ensures that the Number of runs
+                    # counter is not affected by the exception.
+                    LOG.warning(f"Suppressed an exception while "
+                                f"deleting run {run.name}. Error: {e}")
 
             session.close()
 
@@ -3436,7 +3742,7 @@ class ThriftRequestHandler:
 
         # Decrement the number of runs but do not update the latest storage
         # date.
-        self._set_run_data_for_curr_product(-1 * len(runs))
+        self._set_run_data_for_curr_product(-1 * deleted_run_cnt)
 
         # Remove unused comments and unused analysis info from the database.
         # Originally db_cleanup.remove_unused_data() was used here which
@@ -3445,8 +3751,8 @@ class ThriftRequestHandler:
         # error. An alternative solution can be adding a timestamp to file
         # entries to delay their removal. The same comment applies to
         # removeRunReports() function.
-        db_cleanup.remove_unused_comments(self._Session)
-        db_cleanup.remove_unused_analysis_info(self._Session)
+        db_cleanup.remove_unused_comments(self._product)
+        db_cleanup.remove_unused_analysis_info(self._product)
 
         return bool(runs)
 
@@ -3485,8 +3791,7 @@ class ThriftRequestHandler:
 
                 return True
             else:
-                msg = 'Run id ' + str(run_id) + \
-                      ' was not found in the database.'
+                msg = f'Run id {run_id} was not found in the database.'
                 LOG.error(msg)
                 raise codechecker_api_shared.ttypes.RequestFailed(
                     codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
@@ -3581,10 +3886,9 @@ class ThriftRequestHandler:
                          name, self._get_username())
                 return True
             else:
-                msg = 'Source component ' + str(name) + \
-                      ' was not found in the database.'
                 raise codechecker_api_shared.ttypes.RequestFailed(
-                    codechecker_api_shared.ttypes.ErrorCode.DATABASE, msg)
+                    codechecker_api_shared.ttypes.ErrorCode.DATABASE,
+                    f'Source component {name} was not found in the database.')
 
     @exc_to_thrift_reqfail
     @timeit
@@ -3601,7 +3905,7 @@ class ThriftRequestHandler:
                 .filter(FileContent.content_hash.in_(file_hashes))
 
             return list(set(file_hashes) -
-                        set([fc.content_hash for fc in q]))
+                        set(fc.content_hash for fc in q))
 
     @exc_to_thrift_reqfail
     @timeit
@@ -3619,7 +3923,7 @@ class ThriftRequestHandler:
                 .filter(FileContent.blame_info.isnot(None))
 
             return list(set(file_hashes) -
-                        set([fc.content_hash for fc in q]))
+                        set(fc.content_hash for fc in q))
 
     @exc_to_thrift_reqfail
     @timeit
@@ -3637,14 +3941,14 @@ class ThriftRequestHandler:
     def allowsStoringAnalysisStatistics(self):
         self.__require_store()
 
-        return True if self._manager.get_analysis_statistics_dir() else False
+        return bool(self._manager.get_analysis_statistics_dir())
 
     @exc_to_thrift_reqfail
     @timeit
     def getAnalysisStatisticsLimits(self):
         self.__require_store()
 
-        cfg = dict()
+        cfg = {}
 
         # Get the limit of failure zip size.
         failure_zip_size = self._manager.get_failure_zip_size()
@@ -3708,17 +4012,18 @@ class ThriftRequestHandler:
             query = get_analysis_statistics_query(
                 session, run_ids, run_history_ids)
 
-            for stat, run_id in query:
-                failed_files = zlib.decompress(stat.failed_files).decode(
-                    'utf-8').split('\n') if stat.failed_files else []
+            for anal_stat, _ in query:
+                failed_files = zlib.decompress(anal_stat.failed_files).decode(
+                    'utf-8').split('\n') if anal_stat.failed_files else []
                 analyzer_version = zlib.decompress(
-                    stat.version).decode('utf-8') if stat.version else None
+                    anal_stat.version).decode('utf-8') \
+                    if anal_stat.version else None
 
-                analyzer_statistics[stat.analyzer_type] = \
+                analyzer_statistics[anal_stat.analyzer_type] = \
                     ttypes.AnalyzerStatistics(version=analyzer_version,
-                                              failed=stat.failed,
+                                              failed=anal_stat.failed,
                                               failedFilePaths=failed_files,
-                                              successful=stat.successful)
+                                              successful=anal_stat.successful)
         return analyzer_statistics
 
     @exc_to_thrift_reqfail

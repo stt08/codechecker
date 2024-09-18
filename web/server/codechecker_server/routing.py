@@ -41,6 +41,12 @@ def is_valid_product_endpoint(uripart):
     Returns whether or not the given URI part is to be considered a valid
     product name.
     """
+    # FIXME: Endpoint "all" should be disallowed, as commit
+    # fd59927013d5482ff10e80994511971770753d0c in Dec 2017 added the ability
+    # for "CodeChecker server" to specify "--db-status all" and
+    # "--db-upgrade-schema all" for the case where *every* product needs to
+    # be checked/upgraded, essentially blocking the ability to status-check
+    # or schema migrate the product at the endpoint literal "all".
 
     # There are some forbidden keywords.
     if uripart in NON_PRODUCT_ENDPOINTS:
@@ -74,6 +80,7 @@ def is_supported_version(version):
     return False
 
 
+# pylint: disable=invalid-name
 def split_client_GET_request(path):
     """
     Split the given request URI to its parts relevant to the server.
@@ -98,6 +105,7 @@ def split_client_GET_request(path):
         return None, parsed_path.lstrip('/')
 
 
+# pylint: disable=invalid-name
 def split_client_POST_request(path):
     """
     Split the given request URI to its parts relevant to the server.
@@ -129,6 +137,7 @@ def split_client_POST_request(path):
     return None, None, None
 
 
+# pylint: disable=invalid-name
 def is_protected_GET_entrypoint(path):
     """
     Returns if the given GET request's PATH enters the server through an

@@ -126,7 +126,7 @@ def __has_enabled_checker(ch: AnalyzerConfigHandler):
     Returns True if at least one checker is enabled in the given config
     handler.
     """
-    return any(state == CheckerState.enabled
+    return any(state == CheckerState.ENABLED
                for _, (state, _) in ch.checks().items())
 
 
@@ -137,17 +137,13 @@ def perform_analysis(args, skip_handlers, rs_handler: ReviewStatusHandler,
     in the given analysis context for the supplied build actions.
     Additionally, insert statistical information into the metadata dict.
     """
-    # pylint: disable=no-member multiprocess module members.
-
     context = analyzer_context.get_context()
 
     ctu_reanalyze_on_failure = 'ctu_reanalyze_on_failure' in args and \
         args.ctu_reanalyze_on_failure
 
-    analyzers = args.analyzers if 'analyzers' in args \
-        else analyzer_types.supported_analyzers
-    analyzers, errored = analyzer_types.check_supported_analyzers(analyzers)
-    analyzer_types.check_available_analyzers(analyzers, errored)
+    analyzers, errored = \
+        analyzer_types.check_available_analyzers(args.analyzers)
 
     ctu_collect = False
     ctu_analyze = False
@@ -184,12 +180,16 @@ def perform_analysis(args, skip_handlers, rs_handler: ReviewStatusHandler,
     # TODO: Its perfectly reasonable for an analyzer plugin to not be able to
     # build their config handler if the analyzer isn't supported in the first
     # place. For now, this seems to be okay, but may not be later.
+    # Even then, if we couldn't get hold of the analyzer binary, we can't do
+    # anything.
     errored_config_map = analyzer_types.build_config_handlers(
-        args, [x for (x, _) in errored])
+        args,
+        [x for (x, _) in errored
+         if analyzer_types.supported_analyzers[x].analyzer_binary()])
 
     no_checker_err_analyzers = \
-        [a for (a, _) in errored
-         if not __has_enabled_checker(errored_config_map[a])]
+        [analyzer for analyzer, config_h in errored_config_map.items()
+         if not __has_enabled_checker(config_h)]
 
     errored = [(an, msg) for an, msg in errored
                if an not in no_checker_err_analyzers]
@@ -242,19 +242,19 @@ def perform_analysis(args, skip_handlers, rs_handler: ReviewStatusHandler,
         for check, data in config_map[analyzer].checks().items():
             state, _ = data
             metadata_info['checkers'].update({
-                check: state == CheckerState.enabled})
-            if state == CheckerState.enabled:
+                check: state == CheckerState.ENABLED})
+            if state == CheckerState.ENABLED:
                 enabled_checkers[analyzer].append(check)
 
-        # TODO: cppcheck may require a different environment than clang.
         version = analyzer_types.supported_analyzers[analyzer] \
-            .get_binary_version(context.analyzer_env)
+            .get_binary_version()
         metadata_info['analyzer_statistics']['version'] = version
 
         metadata_tool['analyzers'][analyzer] = metadata_info
-
-    LOG.info("Enabled checkers:\n%s", '\n'.join(
-        k + ': ' + ', '.join(v) for k, v in enabled_checkers.items()))
+    LOG.info("Enabled checker list can be found in %s",
+             os.path.join(args.output_path, "metadata.json"))
+    LOG.debug("Enabled checkers:\n%s", '\n'.join(
+              k + ': ' + ',\n '.join(v) for k, v in enabled_checkers.items()))
 
     if 'makefile' in args and args.makefile:
         statistics_data = __get_statistics_data(args)
@@ -355,7 +355,8 @@ def perform_analysis(args, skip_handlers, rs_handler: ReviewStatusHandler,
     end_time = time.time()
     LOG.info("Analysis length: %s sec.", end_time - start_time)
 
-    analyzer_types.print_unsupported_analyzers(errored)
+    if args.analyzers:
+        analyzer_types.print_unsupported_analyzers(errored)
 
     metadata_tool['timestamps'] = {'begin': start_time,
                                    'end': end_time}

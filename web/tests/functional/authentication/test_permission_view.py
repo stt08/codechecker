@@ -30,7 +30,7 @@ class PermissionManagement(unittest.TestCase):
     def teardown_class(self):
         teardown_class_common()
 
-    def setup_method(self, method):
+    def setup_method(self, _):
         # TEST_WORKSPACE is automatically set by test package __init__.py .
         self._test_workspace = os.environ['TEST_WORKSPACE']
 
@@ -102,19 +102,19 @@ class PermissionManagement(unittest.TestCase):
         self.assertTrue(len(permissions), 1)
         self.assertIn("PERMISSION_VIEW", permissions)
 
-        self.assertDictContainsSubset(
-            {'permission_view_group': ['PERMISSION_VIEW']},
-            global_permissions.group)
+        self.assertLessEqual(
+            {'permission_view_group': ['PERMISSION_VIEW']}.items(),
+            global_permissions.group.items())
 
         product_permissions = access_control.productPermissions
         self.assertTrue(product_permissions)
 
         auth_product_permissions = product_permissions["authentication"]
-        self.assertDictContainsSubset(
+        self.assertLessEqual(
             {'cc': ['PRODUCT_STORE'],
              'john': ['PRODUCT_STORE'],
-             'admin': ['PRODUCT_ADMIN']},
-            auth_product_permissions.user)
+             'admin': ['PRODUCT_ADMIN']}.items(),
+            auth_product_permissions.user.items())
 
         # Previously, the test files in this directory interfered at one
         # another, and the group permission dict wasn't empty. Check git blame.

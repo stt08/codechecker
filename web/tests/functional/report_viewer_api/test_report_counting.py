@@ -44,9 +44,8 @@ class TestReportFilter(unittest.TestCase):
     def teardown_class(self):
         teardown_class_common()
 
-    def setup_method(self, method):
+    def setup_method(self, _):
         test_workspace = os.environ['TEST_WORKSPACE']
-        self.maxDiff = None
 
         test_class = self.__class__.__name__
         print('Running ' + test_class + ' tests in ' + test_workspace)
@@ -90,9 +89,9 @@ class TestReportFilter(unittest.TestCase):
              'deadcode.DeadStores': 6,
              'misc-definitions-in-headers': 2}
 
-        self.run1_sev_counts = {Severity.MEDIUM: 6,
+        self.run1_sev_counts = {Severity.MEDIUM: 11,
                                 Severity.LOW: 6,
-                                Severity.HIGH: 32}
+                                Severity.HIGH: 27}
 
         self.run2_sev_counts = {Severity.MEDIUM: 5,
                                 Severity.LOW: 6,
@@ -149,7 +148,7 @@ class TestReportFilter(unittest.TestCase):
         checkers_dict = dict((res.name, res.count) for res in checker_counts)
 
         self.assertGreaterEqual(len(checker_counts), len(self.run1_checkers))
-        self.assertDictContainsSubset(self.run1_checkers, checkers_dict)
+        self.assertLessEqual(self.run1_checkers.items(), checkers_dict.items())
 
     def test_run1_core_checkers(self):
         """
@@ -168,7 +167,7 @@ class TestReportFilter(unittest.TestCase):
                          if "core." in k}
 
         self.assertGreaterEqual(len(checker_counts), len(core_checkers))
-        self.assertDictContainsSubset(core_checkers, checkers_dict)
+        self.assertLessEqual(core_checkers.items(), checkers_dict.items())
 
     def test_run2_all_checkers(self):
         """
@@ -183,7 +182,7 @@ class TestReportFilter(unittest.TestCase):
         checkers_dict = dict((res.name, res.count) for res in checker_counts)
 
         self.assertGreaterEqual(len(checker_counts), len(self.run2_checkers))
-        self.assertDictContainsSubset(self.run2_checkers, checkers_dict)
+        self.assertLessEqual(self.run2_checkers.items(), checkers_dict.items())
 
     def test_run1_run2_all_checkers(self):
         """
@@ -226,7 +225,7 @@ class TestReportFilter(unittest.TestCase):
         all_core = dict(r1_core + r2_core)
 
         self.assertGreaterEqual(len(checker_counts), len(all_core))
-        self.assertDictContainsSubset(all_core, checkers_dict)
+        self.assertLessEqual(all_core.items(), checkers_dict.items())
 
     def test_run1_all_severity(self):
         """
@@ -369,7 +368,7 @@ class TestReportFilter(unittest.TestCase):
                         Counter(stack_r1) + Counter(stack_r2))
 
         self.assertGreaterEqual(len(res), len(test_res))
-        self.assertDictContainsSubset(test_res, res)
+        self.assertLessEqual(test_res.items(), res.items())
 
     def test_run1_run2_all_checker_msg(self):
         """

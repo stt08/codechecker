@@ -26,7 +26,7 @@ from . import host_check
 LOG = get_logger('buildlogger')
 
 
-def execute_buildcmd(command, silent=False, env=None, cwd=None):
+def execute_buildcmd(command, silent=False, environ=None, cwd=None):
     """
     Execute the the build command and continuously write
     the output from the process to the standard output.
@@ -34,7 +34,7 @@ def execute_buildcmd(command, silent=False, env=None, cwd=None):
     proc = subprocess.Popen(
         command,
         bufsize=-1,
-        env=env,
+        env=environ,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         cwd=cwd,
@@ -85,7 +85,7 @@ def perform_build_command(logfile, command, keep_link, silent=False,
         open(logfile, 'a', encoding="utf-8", errors="ignore").close()
         log_env = env.get_log_env(logfile, original_env)
         if 'CC_LOGGER_GCC_LIKE' not in log_env:
-            log_env['CC_LOGGER_GCC_LIKE'] = 'gcc:g++:clang:clang++:cc:c++'
+            log_env['CC_LOGGER_GCC_LIKE'] = 'gcc:g++:clang:clang++:/cc:c++'
         if keep_link or ('CC_LOGGER_KEEP_LINK' in log_env and
                          log_env['CC_LOGGER_KEEP_LINK'] == 'true'):
             log_env['CC_LOGGER_KEEP_LINK'] = 'true'

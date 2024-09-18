@@ -21,7 +21,7 @@ import subprocess
 import time
 import unittest
 
-from distutils.spawn import find_executable
+from shutil import which
 
 from libtest import env
 
@@ -50,7 +50,7 @@ class TestFixit(unittest.TestCase):
         print("Removing: " + TEST_WORKSPACE)
         shutil.rmtree(TEST_WORKSPACE)
 
-    def setup_method(self, method):
+    def setup_method(self, _):
 
         # TEST_WORKSPACE is automatically set by test package __init__.py .
         self.test_workspace = os.environ['TEST_WORKSPACE']
@@ -64,13 +64,13 @@ class TestFixit(unittest.TestCase):
         # Change working dir to testfile dir so CodeChecker can be run easily.
         self.__old_pwd = os.getcwd()
 
-    def teardown_method(self, method):
+    def teardown_method(self, _):
         """Restore environment after tests have run."""
         os.chdir(self.__old_pwd)
         if os.path.isdir(self.report_dir):
             shutil.rmtree(self.report_dir)
 
-    @unittest.skipIf(find_executable('clang-apply-replacements') is None,
+    @unittest.skipIf(which('clang-apply-replacements') is None,
                      "clang-apply-replacements clang tool must be available "
                      "in the environment.")
     def test_fixit_list(self):
@@ -131,7 +131,8 @@ int main()
         yaml_files = os.listdir(fixit_dir)
         self.assertEqual(len(yaml_files), 1)
 
-        with open(os.path.join(fixit_dir, yaml_files[0])) as f:
+        with open(os.path.join(fixit_dir, yaml_files[0]), encoding='utf-8') \
+                as f:
             content = f.read()
             self.assertIn("v.empty()", content)
 
@@ -165,7 +166,7 @@ int main()
             self.assertIn("v.empty()", new_source_file)
             self.assertNotIn("v.size()", new_source_file)
 
-    @unittest.skipIf(find_executable('clang-apply-replacements') is None,
+    @unittest.skipIf(which('clang-apply-replacements') is None,
                      "clang-apply-replacements clang tool must be available "
                      "in the environment.")
     def test_fixit_file_modification(self):
@@ -253,7 +254,7 @@ int main()
         self.assertIn('Skipped files due to modification since last analysis',
                       err)
 
-    @unittest.skipIf(find_executable('clang-apply-replacements') is None,
+    @unittest.skipIf(which('clang-apply-replacements') is None,
                      "clang-apply-replacements clang tool must be available "
                      "in the environment.")
     def test_fixit_by_diff(self):
@@ -351,7 +352,7 @@ int main()
         print('\n' + out + '\n')
         self.assertEqual(out.count("DiagnosticMessage"), 1)
 
-    @unittest.skipIf(find_executable('clang-apply-replacements') is None,
+    @unittest.skipIf(which('clang-apply-replacements') is None,
                      "clang-apply-replacements clang tool must be available "
                      "in the environment.")
     def test_fixit_apply_failure(self):

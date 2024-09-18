@@ -14,7 +14,7 @@ import os
 import shlex
 import subprocess
 
-from distutils import util
+from codechecker_common.util import strtobool
 
 from codechecker_analyzer import host_check
 
@@ -136,8 +136,7 @@ def check_force_ctu_capable(is_capable):
     """
     if not is_capable:
         try:
-            return bool(util.strtobool(
-                os.environ['CC_TEST_FORCE_CTU_CAPABLE']))
+            return strtobool(os.environ['CC_TEST_FORCE_CTU_CAPABLE'])
         except (ValueError, KeyError):
             pass
 

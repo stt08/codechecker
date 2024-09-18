@@ -32,7 +32,7 @@ from ..flag import has_flag
 from ..flag import prepend_all
 
 from . import config_handler
-from . import result_handler
+from . import result_handler as clangtidy_result_handler
 
 LOG = get_logger('analyzer')
 
@@ -49,8 +49,10 @@ def parse_checkers(tidy_output):
         line = line.strip()
         if line.startswith('Enabled checks:') or line == '':
             continue
-        elif line.startswith('clang-analyzer-'):
+
+        if line.startswith('clang-analyzer-'):
             continue
+
         match = pattern.match(line)
         if match:
             checkers.append((match.group(0), ''))
@@ -66,10 +68,10 @@ def parse_checker_config_old(config_dump):
     config_dump -- clang-tidy config options YAML dump in pre-LLVM15 format.
     """
     reg = re.compile(r'key:\s+(\S+)\s+value:\s+([^\n]+)')
-    all = re.findall(reg, config_dump)
+    result = re.findall(reg, config_dump)
     # tidy emits the checker option with a "." prefix, but we need a ":"
-    all = [(option[0].replace(".", ":"), option[1]) for option in all]
-    return all
+    result = [(option[0].replace(".", ":"), option[1]) for option in result]
+    return result
 
 
 def parse_checker_config_new(config_dump):
@@ -134,15 +136,19 @@ def get_diagtool_bin():
     if os.path.exists(diagtool_bin):
         return diagtool_bin
 
-    LOG.debug("'diagtool' can not be found next to the clang binary (%s)!",
-              clang_bin)
+    LOG.warning(
+        "'diagtool' can not be found next to the clang binary (%s)!",
+        clang_bin)
+
+    return None
 
 
-def get_warnings(env=None):
+def get_warnings():
     """
     Returns list of warning flags by using diagtool.
     """
     diagtool_bin = get_diagtool_bin()
+    environment = analyzer_context.get_context().get_env_for_bin(diagtool_bin)
 
     if not diagtool_bin:
         return []
@@ -150,7 +156,7 @@ def get_warnings(env=None):
     try:
         result = subprocess.check_output(
             [diagtool_bin, 'tree'],
-            env=env,
+            env=environment,
             universal_newlines=True,
             encoding="utf-8",
             errors="ignore")
@@ -163,8 +169,6 @@ def get_warnings(env=None):
                   "alongside 'clang' and 'clang-tidy'! Error message: %s",
                   exc.output)
 
-        raise
-    except OSError:
         raise
 
 
@@ -215,6 +219,7 @@ def parse_version(tidy_output):
     match = version_re.match(tidy_output)
     if match:
         return match.group('version')
+    return None
 
 
 class ClangTidy(analyzer_base.SourceAnalyzer):
@@ -233,12 +238,14 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
             .analyzer_binaries[cls.ANALYZER_NAME]
 
     @classmethod
-    def get_binary_version(self, environ, details=False) -> str:
-        # No need to LOG here, we will emit a warning later anyway.
-        if not self.analyzer_binary():
+    def get_binary_version(cls, details=False) -> str:
+        if not cls.analyzer_binary():
             return None
+        # No need to LOG here, we will emit a warning later anyway.
+        environ = analyzer_context.get_context().get_env_for_bin(
+            cls.analyzer_binary())
 
-        version = [self.analyzer_binary(), '--version']
+        version = [cls.analyzer_binary(), '--version']
         try:
             output = subprocess.check_output(version,
                                              env=environ,
@@ -255,7 +262,7 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
 
         return None
 
-    def add_checker_config(self, checker_cfg):
+    def add_checker_config(self, _):
         LOG.error("Not implemented yet")
 
     @classmethod
@@ -267,7 +274,8 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
             if cls.__analyzer_checkers:
                 return cls.__analyzer_checkers
 
-            environ = analyzer_context.get_context().analyzer_env
+            environ = analyzer_context\
+                .get_context().get_env_for_bin(cls.analyzer_binary())
             result = subprocess.check_output(
                 [cls.analyzer_binary(), "-list-checks", "-checks=*"],
                 env=environ,
@@ -278,7 +286,7 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
 
             checker_description.extend(
                 ("clang-diagnostic-" + warning, "")
-                for warning in get_warnings(environ))
+                for warning in get_warnings())
 
             cls.__analyzer_checkers = checker_description
 
@@ -294,7 +302,8 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         try:
             result = subprocess.check_output(
                 [cls.analyzer_binary(), "-dump-config", "-checks=*"],
-                env=analyzer_context.get_context().analyzer_env,
+                env=analyzer_context.get_context()
+                .get_env_for_bin(cls.analyzer_binary()),
                 universal_newlines=True,
                 encoding="utf-8",
                 errors="ignore")
@@ -307,10 +316,14 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         """
         Return the analyzer configuration with all checkers enabled.
         """
+        if not cls.analyzer_binary():
+            return []
+
         try:
             result = subprocess.check_output(
                 [cls.analyzer_binary(), "-dump-config", "-checks=*"],
-                env=analyzer_context.get_context().analyzer_env,
+                env=analyzer_context.get_context()
+                .get_env_for_bin(cls.analyzer_binary()),
                 universal_newlines=True,
                 encoding="utf-8",
                 errors="ignore")
@@ -349,8 +362,8 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         # enable a compiler warning, we first have to undo the -checks level
         # disable and then enable it, so we need both
         # -checks=compiler-diagnostic- and -W.
-        compiler_warnings = list()
-        enabled_checkers = list()
+        compiler_warnings = []
+        enabled_checkers = []
 
         has_checker_config = \
             config.checker_config and config.checker_config != '{}'
@@ -370,16 +383,16 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
 
             if warning_name is not None:
                 # -W and clang-diagnostic- are added as compiler warnings.
-                if warning_type == CheckerType.compiler:
+                if warning_type == CheckerType.COMPILER:
                     LOG.warning("As of CodeChecker v6.22, the following usage"
                                 f"of '{checker_name}' compiler warning as a "
                                 "checker name is deprecated, please use "
                                 f"'clang-diagnostic-{checker_name[1:]}' "
                                 "instead.")
-                    if state == CheckerState.enabled:
+                    if state == CheckerState.ENABLED:
                         compiler_warnings.append('-W' + warning_name)
                         enabled_checkers.append(checker_name)
-                    elif state == CheckerState.disabled:
+                    elif state == CheckerState.DISABLED:
                         if config.enable_all:
                             LOG.warning("Disabling compiler warning with "
                                         f"compiler flag '-d W{warning_name}' "
@@ -388,16 +401,21 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
                 # warning as -W..., if it is disabled, tidy can suppress when
                 # specified in the -checks parameter list, so we add it there
                 # as -clang-diagnostic-... .
-                elif warning_type == CheckerType.analyzer:
-                    if state == CheckerState.enabled:
-                        compiler_warnings.append('-W' + warning_name)
+                elif warning_type == CheckerType.ANALYZER:
+                    if state == CheckerState.ENABLED:
+                        if checker_name == "clang-diagnostic-error":
+                            # Disable warning of clang-diagnostic-error to
+                            # avoid generated compiler errors.
+                            compiler_warnings.append('-Wno-' + warning_name)
+                        else:
+                            compiler_warnings.append('-W' + warning_name)
                         enabled_checkers.append(checker_name)
                     else:
                         compiler_warnings.append('-Wno-' + warning_name)
 
                 continue
 
-            if state == CheckerState.enabled:
+            if state == CheckerState.ENABLED:
                 enabled_checkers.append(checker_name)
 
         # By default all checkers are disabled and the enabled ones are added
@@ -448,7 +466,7 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
                 # The invocation should end in a Popen call with shell=False,
                 # so no globbing should occur even if the checks argument
                 # contains characters that would trigger globbing in the shell.
-                analyzer_cmd.append("-checks=%s" % ','.join(checks))
+                analyzer_cmd.append(f"-checks={','.join(checks)}")
 
             analyzer_cmd.extend(config.analyzer_extra_arguments)
 
@@ -483,7 +501,8 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
             analyzer_cmd.extend(self.buildaction.analyzer_options)
 
             analyzer_cmd.extend(prepend_all(
-                '-isystem',
+                '-isystem' if config.add_gcc_include_dirs_with_isystem else
+                '-idirafter',
                 self.buildaction.compiler_includes))
 
             if not has_flag('-std', analyzer_cmd) and not \
@@ -555,7 +574,7 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         return clangtidy
 
     @classmethod
-    def is_binary_version_incompatible(cls, environ):
+    def is_binary_version_incompatible(cls):
         """
         We support pretty much every Clang-Tidy version.
         """
@@ -567,7 +586,7 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         See base class for docs.
         """
         report_hash = self.config_handler.report_hash
-        res_handler = result_handler.ClangTidyResultHandler(
+        res_handler = clangtidy_result_handler.ClangTidyResultHandler(
             buildaction, report_output, report_hash)
 
         res_handler.skiplist_handler = skiplist_handler
@@ -578,6 +597,10 @@ class ClangTidy(analyzer_base.SourceAnalyzer):
         handler = config_handler.ClangTidyConfigHandler()
         handler.report_hash = args.report_hash \
             if 'report_hash' in args else None
+
+        handler.add_gcc_include_dirs_with_isystem = \
+            'add_gcc_include_dirs_with_isystem' in args and \
+            args.add_gcc_include_dirs_with_isystem
 
         # FIXME We cannot get the resource dir from the clang-tidy binary,
         # therefore we get a sibling clang binary which of clang-tidy.

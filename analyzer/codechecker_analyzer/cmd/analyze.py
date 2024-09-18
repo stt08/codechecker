@@ -9,16 +9,14 @@
 Execute analysis over an already existing build.json compilation database.
 """
 
-
 import argparse
 import collections
 import json
 import os
 import shutil
 import sys
-
-import multiprocess
 from typing import List
+from pathlib import Path
 
 from tu_collector import tu_collector
 
@@ -27,21 +25,22 @@ from codechecker_analyzer import analyzer, analyzer_context, \
 from codechecker_analyzer.analyzers import analyzer_types, clangsa
 from codechecker_analyzer.arg import \
     OrderedCheckersAction, OrderedConfigAction, existing_abspath, \
-    analyzer_config, checker_config
+    analyzer_config, checker_config, AnalyzerConfig, CheckerConfig
+
 from codechecker_analyzer.buildlog import log_parser
 
 from codechecker_common import arg, logger, cmd_config, review_status_handler
+from codechecker_common.compatibility.multiprocessing import cpu_count
 from codechecker_common.skiplist_handler import SkipListHandler, \
     SkipListHandlers
 from codechecker_common.util import load_json
-
 
 LOG = logger.get_logger('system')
 
 header_file_extensions = (
     '.h', '.hh', '.H', '.hp', '.hxx', '.hpp', '.HPP', '.h++', '.tcc')
 
-epilog_env_var = f"""
+EPILOG_ENV_VAR = """
   CC_ANALYZERS_FROM_PATH   Set to `yes` or `1` to enforce taking the analyzers
                            from the `PATH` instead of the given binaries.
   CC_ANALYZER_BIN          Set the absolute paths of an analyzer binaries.
@@ -55,7 +54,7 @@ epilog_env_var = f"""
                            variable.
 """
 
-epilog_issue_hashes = """
+EPILOG_ISSUE_HASHES = """
 Issue hashes
 ------------------------------------------------
 - By default the issue hash calculation method for 'Clang Static Analyzer' is
@@ -106,7 +105,7 @@ For more information see:
 https://github.com/Ericsson/codechecker/blob/master/docs/analyzer/report_identification.md
 """
 
-epilog_exit_status = """
+EPILOG_EXIT_STATUS = """
 Exit status
 ------------------------------------------------
 0 - Successful analysis
@@ -135,11 +134,11 @@ the project, outputting analysis results in a machine-readable format.""",
         'epilog': f"""
 Environment variables
 ------------------------------------------------
-{epilog_env_var}
+{EPILOG_ENV_VAR}
 
-{epilog_issue_hashes}
+{EPILOG_ISSUE_HASHES}
 
-{epilog_exit_status}
+{EPILOG_EXIT_STATUS}
 
 Compilation databases can be created by instrumenting your project's build via
 'CodeChecker log'. To transform the results of the analysis to a human-friendly
@@ -169,8 +168,7 @@ def add_arguments_to_parser(parser):
                         type=int,
                         dest="jobs",
                         required=False,
-                        # pylint: disable=no-member
-                        default=multiprocess.cpu_count(),
+                        default=cpu_count(),
                         help="Number of threads to use in analysis. More "
                              "threads mean faster analysis at the cost of "
                              "using more memory.")
@@ -244,6 +242,17 @@ def add_arguments_to_parser(parser):
                              "include paths. Use this flag if Clang analysis "
                              "fails with error message related to __builtin "
                              "symbols.")
+
+    parser.add_argument('--add-gcc-include-dirs-with-isystem',
+                        dest="add_gcc_include_dirs_with_isystem",
+                        required=False,
+                        action='store_true',
+                        default=False,
+                        help="Implicit include directories are appended to "
+                             "the analyzer command with -idirafter. If "
+                             "-isystem is needed instead, as it was used "
+                             "before CodeChecker 6.24.1, this flag can be "
+                             "used.")
 
     parser.add_argument('-t', '--type', '--output-format',
                         dest="output_format",
@@ -363,7 +372,7 @@ def add_arguments_to_parser(parser):
                                metavar='ANALYZER',
                                required=False,
                                choices=analyzer_types.supported_analyzers,
-                               default=argparse.SUPPRESS,
+                               default=None,
                                help="Run analysis only with the analyzers "
                                     "specified. Currently supported analyzers "
                                     "are: " +
@@ -790,11 +799,98 @@ LLVM/Clang community, and thus discouraged.
                                default=argparse.SUPPRESS,
                                help="Emit a warning instead of an error when "
                                     "an unknown checker name is given to "
-                                    "either --enable or --disable.")
+                                    "either --enable, --disable,"
+                                    "--analyzer-config and/or "
+                                    "--checker-config.")
 
     logger.add_verbose_arguments(parser)
     parser.set_defaults(
         func=main, func_process_config_file=cmd_config.process_config_file)
+
+
+def is_analyzer_config_valid(analyzer_conf: List[AnalyzerConfig]) -> bool:
+    """
+    Ensure that the analyzer_config parameter is set to a valid value
+    by verifying if it belongs to the set of allowed values.
+    """
+    wrong_configs = []
+    supported_analyzers = analyzer_types.supported_analyzers
+
+    for cfg in analyzer_conf:
+        if cfg.analyzer not in supported_analyzers:
+            wrong_configs.append((cfg.analyzer, None))
+            continue
+
+        analyzer_class = supported_analyzers[cfg.analyzer]
+        analyzer_name = analyzer_class.ANALYZER_NAME
+        analyzers = [analyzer[0] for analyzer in
+                     analyzer_class.get_analyzer_config()]
+
+        # Make sure "[clang-tidy] Allow to override checker list #3203" works
+        if analyzer_name == 'clang-tidy':
+            analyzers.append('take-config-from-directory')
+
+        if cfg.analyzer == analyzer_name and cfg.option not in analyzers:
+            wrong_configs.append((analyzer_name, cfg.option))
+
+    if wrong_configs:
+        for analyzer_name, option in wrong_configs:
+            if option is None:
+                LOG.error(
+                    f"Invalid argument to --analyzer-config: {analyzer_name} "
+                    f"is not a supported analyzer. Supported analyzers are: "
+                    f"{', '.join(a for a in supported_analyzers)}.")
+            else:
+                LOG.error(
+                    f"Invalid argument to --analyzer-config: {analyzer_name} "
+                    f"has no config named {option}. Use the 'CodeChecker "
+                    f"analyzers --analyzer-config {analyzer_name}' command to "
+                    f"see available configs.")
+
+        return False
+
+    return True
+
+
+def is_checker_config_valid(checker_conf: List[CheckerConfig]) -> bool:
+    """
+    Ensure that the checker_config parameter is set to a valid value
+    by verifying if it belongs to the set of allowed values.
+    """
+    wrong_configs = []
+    supported_analyzers = analyzer_types.supported_analyzers
+
+    for cfg in checker_conf:
+        if cfg.analyzer not in supported_analyzers:
+            wrong_configs.append((cfg.analyzer, None))
+            continue
+
+        analyzer_class = supported_analyzers[cfg.analyzer]
+        analyzer_name = analyzer_class.ANALYZER_NAME
+        checker_conf_opt = f"{cfg.checker}:{cfg.option}"
+        checkers = [checker[0] for checker in
+                    analyzer_class.get_checker_config()]
+
+        if cfg.analyzer == analyzer_name and checker_conf_opt not in checkers:
+            wrong_configs.append((analyzer_name, checker_conf_opt))
+
+    if wrong_configs:
+        for analyzer_name, conf_opt in wrong_configs:
+            if conf_opt is None:
+                LOG.error(
+                    f"Invalid argument to --checker-config: {analyzer_name} "
+                    f"is not a supported analyzer. Supported analyzers are: "
+                    f"{', '.join(a for a in supported_analyzers)}.")
+            else:
+                LOG.error(
+                    f"Invalid argument to --checker-config: invalid checker "
+                    f"and/or checker option '{conf_opt}' for {analyzer_name}. "
+                    f"Use the 'CodeChecker checkers --checker-config' command "
+                    f"to see available checkers.")
+
+        return False
+
+    return True
 
 
 def get_affected_file_paths(
@@ -807,7 +903,8 @@ def get_affected_file_paths(
     """
     file_paths = []  # Use list to keep the order of the file paths.
     for file_filter in file_filters:
-        file_paths.append(file_filter)
+        file_paths.append(str(Path(file_filter).resolve())
+                          if '*' not in file_filter else file_filter)
 
         if os.path.exists(file_filter) and \
                 file_filter.endswith(header_file_extensions):
@@ -836,7 +933,7 @@ def __get_skip_handlers(args, compile_commands) -> SkipListHandlers:
 
         # Creates a skip file where all source files will be skipped except
         # the given source files and all the header files.
-        skip_files = ['+{0}'.format(f) for f in source_file_paths]
+        skip_files = [f'+{f}' for f in source_file_paths]
         skip_files.extend(['+/*.h', '+/*.H', '+/*.tcc'])
         skip_files.append('-*')
         content = "\n".join(skip_files)
@@ -934,6 +1031,23 @@ def main(args):
     """
     logger.setup_logger(args.verbose if 'verbose' in args else None)
 
+    # Validate analyzer and checker config (if any)
+    config_validator = {
+        'analyzer_config': is_analyzer_config_valid,
+        'checker_config': is_checker_config_valid
+    }
+
+    config_validator_res = [validate_func(getattr(args, conf))
+                            for conf, validate_func in config_validator.items()
+                            if conf in args]
+
+    if False in config_validator_res \
+            and 'no_missing_checker_error' not in args:
+        LOG.info("Although it is not recommended, if you want to suppress "
+                 "errors relating to unknown analyzer/checker configs, "
+                 "consider using the option '--no-missing-checker-error'")
+        sys.exit(1)
+
     if 'tidy_config' in args:
         LOG.warning(
             "--tidy-config is deprecated and will be removed in the next "
@@ -980,6 +1094,7 @@ def main(args):
     compile_commands = \
         compilation_database.gather_compilation_database(args.input)
     if compile_commands is None:
+        LOG.error(f"Found no compilation commands in '{args.input}'")
         sys.exit(1)
 
     # Process the skip list if present.
@@ -1066,9 +1181,9 @@ def main(args):
         analyzer_clang_version)
 
     if not actions:
-        LOG.info("No analysis is required.\nThere were no compilation "
-                 "commands in the provided compilation database or "
-                 "all of them were skipped.")
+        LOG.warning("No analysis is required.")
+        LOG.warning("There were no compilation commands in the provided "
+                    "compilation database or all of them were skipped.")
         sys.exit(0)
 
     uniqued_compilation_db_file = os.path.join(
@@ -1084,8 +1199,8 @@ def main(args):
             'name': 'codechecker',
             'action_num': len(actions),
             'command': sys.argv,
-            'version': "{0} ({1})".format(context.package_git_tag,
-                                          context.package_git_hash),
+            'version':
+            f"{context.package_git_tag} ({context.package_git_hash})",
             'working_directory': os.getcwd(),
             'output_path': args.output_path,
             'result_source_files': {},
@@ -1157,7 +1272,6 @@ def main(args):
         LOG.debug("Sending analyzer statistics finished.")
     except Exception:
         LOG.debug("Failed to send analyzer statistics!")
-        pass
 
     # Generally exit status is set by sys.exit() call in CodeChecker. However,
     # exit code 3 has a special meaning: it returns when the underlying
@@ -1170,3 +1284,5 @@ def main(args):
     for analyzer_data in metadata_tool['analyzers'].values():
         if analyzer_data['analyzer_statistics']['failed'] != 0:
             return 3
+
+    return 0

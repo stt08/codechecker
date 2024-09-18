@@ -5,13 +5,8 @@
 #  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
 # -------------------------------------------------------------------------
-"""
-"""
 from collections import defaultdict
-# TODO distutils will be removed in python3.12
-from distutils.version import StrictVersion
-import os
-import pickle
+from packaging.version import Version
 import shlex
 import subprocess
 
@@ -46,12 +41,10 @@ class Gcc(analyzer_base.SourceAnalyzer):
         # TODO
         pass
 
-    @classmethod
     def get_analyzer_mentioned_files(self, output):
         """
         This is mostly used for CTU, which is absent in GCC.
         """
-        pass
 
     def construct_analyzer_cmd(self, result_handler):
         """
@@ -62,6 +55,8 @@ class Gcc(analyzer_base.SourceAnalyzer):
         # unforeseen exceptions where a general catch is justified?
         config = self.config_handler
 
+        if not Gcc.analyzer_binary():
+            return None
         # We don't want GCC do start linking, but -fsyntax-only stops the
         # compilation process too early for proper diagnostics generation.
         analyzer_cmd = [Gcc.analyzer_binary(), '-fanalyzer', '-c',
@@ -75,7 +70,7 @@ class Gcc(analyzer_base.SourceAnalyzer):
         analyzer_cmd.append('-fdiagnostics-format=sarif-stderr')
 
         for checker_name, value in config.checks().items():
-            if value[0] == CheckerState.disabled:
+            if value[0] == CheckerState.DISABLED:
                 # TODO python3.9 removeprefix method would be nicer
                 # than startswith and a hardcoded slicing
                 analyzer_cmd.append(
@@ -93,15 +88,19 @@ class Gcc(analyzer_base.SourceAnalyzer):
         return analyzer_cmd
 
     @classmethod
-    def get_analyzer_checkers(self):
+    def get_analyzer_checkers(cls):
         """
         Return the list of the supported checkers.
         """
-        command = [self.analyzer_binary(), "--help=warning"]
+        command = [cls.analyzer_binary(), "--help=warning"]
+        if not cls.analyzer_binary():
+            return []
+        environ = analyzer_context.get_context().get_env_for_bin(
+            command[0])
         checker_list = []
 
         try:
-            output = subprocess.check_output(command)
+            output = subprocess.check_output(command, env=environ)
 
             # Still contains the help message we need to remove.
             for entry in output.decode().split('\n'):
@@ -137,17 +136,6 @@ class Gcc(analyzer_base.SourceAnalyzer):
         # TODO
         return []
 
-    def analyze(self, analyzer_cmd, res_handler, proc_callback=None):
-        env = None
-
-        original_env_file = os.environ.get(
-            'CODECHECKER_ORIGINAL_BUILD_ENV')
-        if original_env_file:
-            with open(original_env_file, 'rb') as env_file:
-                env = pickle.load(env_file, encoding='utf-8')
-
-        return super().analyze(analyzer_cmd, res_handler, proc_callback, env)
-
     def post_analyze(self, result_handler: GccResultHandler):
         """
         Post process the reuslts after the analysis.
@@ -157,29 +145,29 @@ class Gcc(analyzer_base.SourceAnalyzer):
         The report parsing of the Parse command is done recursively.
 
         """
-        pass
 
     @classmethod
-    def resolve_missing_binary(cls, configured_binary, env):
+    def resolve_missing_binary(cls, configured_binary, environ):
         """
         In case of the configured binary for the analyzer is not found in the
         PATH, this method is used to find a callable binary.
         """
         # TODO
-        pass
 
     @classmethod
-    def get_binary_version(self, environ, details=False) -> str:
+    def get_binary_version(cls, details=False) -> str:
         """
         Return the analyzer version.
         """
         # No need to LOG here, we will emit a warning later anyway.
-        if not self.analyzer_binary():
+        if not cls.analyzer_binary():
             return None
+        environ = analyzer_context.get_context().get_env_for_bin(
+            cls.analyzer_binary())
         if details:
-            version = [self.analyzer_binary(), '--version']
+            version = [cls.analyzer_binary(), '--version']
         else:
-            version = [self.analyzer_binary(), '-dumpfullversion']
+            version = [cls.analyzer_binary(), '-dumpfullversion']
         try:
             output = subprocess.check_output(version,
                                              env=environ,
@@ -194,11 +182,11 @@ class Gcc(analyzer_base.SourceAnalyzer):
         return None
 
     @classmethod
-    def is_binary_version_incompatible(cls, environ):
+    def is_binary_version_incompatible(cls):
         """
         Check the version compatibility of the given analyzer binary.
         """
-        analyzer_version = cls.get_binary_version(environ)
+        analyzer_version = cls.get_binary_version()
 
         if analyzer_version is None:
             return "GCC binary is too old to support -dumpfullversion."
@@ -206,7 +194,7 @@ class Gcc(analyzer_base.SourceAnalyzer):
         # The analyzer version should be above 13.0.0 because the
         # '-fdiagnostics-format=sarif-file' argument was introduced in this
         # release.
-        if analyzer_version >= StrictVersion("13.0.0"):
+        if Version(analyzer_version) >= Version("13.0.0"):
             return None
 
         return f"GCC binary found is too old at v{analyzer_version.strip()}; "\
